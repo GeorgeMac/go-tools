@@ -476,12 +476,11 @@ func (srv *Server) markDirty(filename string) {
 	pkg.MarkDirty()
 }
 
-func (srv *Server) compiledPackage(path string) *loader.Package {
-	pkg, err := srv.lprog.CompiledPackage(path)
+func errorsToDiagnostics(errs []error) map[string][]lsp.Diagnostic {
 	diags := map[string][]lsp.Diagnostic{}
-	switch err := err.(type) {
-	case loader.TypeErrors:
-		for _, err := range err {
+	for _, err := range errs {
+		switch err := err.(type) {
+		case types.Error:
 			pos := err.Fset.Position(err.Pos)
 			lsppos := lsp.Position{
 				Line:      pos.Line - 1,
@@ -497,29 +496,36 @@ func (srv *Server) compiledPackage(path string) *loader.Package {
 				Message:  err.Msg,
 			}
 			diags[pos.Filename] = append(diags[pos.Filename], diag)
-		}
-	case scanner.ErrorList:
-		for _, err := range err {
-			lsppos := lsp.Position{
-				Line:      err.Pos.Line - 1,
-				Character: err.Pos.Column - 1,
+		case scanner.ErrorList:
+			for _, err := range err {
+				lsppos := lsp.Position{
+					Line:      err.Pos.Line - 1,
+					Character: err.Pos.Column - 1,
+				}
+				diag := lsp.Diagnostic{
+					Range: lsp.Range{
+						Start: lsppos,
+						End:   lsppos,
+					},
+					Severity: lsp.Error,
+					Source:   "compile",
+					Message:  err.Msg,
+				}
+				diags[err.Pos.Filename] = append(diags[err.Pos.Filename], diag)
 			}
-			diag := lsp.Diagnostic{
-				Range: lsp.Range{
-					Start: lsppos,
-					End:   lsppos,
-				},
-				Severity: lsp.Error,
-				Source:   "compile",
-				Message:  err.Msg,
-			}
-			diags[err.Pos.Filename] = append(diags[err.Pos.Filename], diag)
+		default:
+			log.Println("unexpected error:", err)
 		}
-	case nil:
-	default:
-		panic(fmt.Sprintf("unexpected error type %T", err))
 	}
 
+	return diags
+}
+func (srv *Server) compiledPackage(path string) *loader.Package {
+	pkg, err := srv.lprog.CompiledPackage(path)
+	if err != nil {
+		panic(err)
+	}
+	diags := errorsToDiagnostics(pkg.Errors)
 	for file, diags := range diags {
 		params := lsp.PublishDiagnosticsParams{
 			URI: &lsp.URI{

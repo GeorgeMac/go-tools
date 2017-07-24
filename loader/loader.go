@@ -2,6 +2,7 @@ package loader
 
 import (
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/build"
 	"go/parser"
@@ -36,14 +37,23 @@ type Package struct {
 
 	Program *Program
 
-	dirty bool
+	State int
+
+	Errors []error
 }
 
+const (
+	Dirty = 1 << iota
+	InvalidAST
+	TypeError
+	NoSSA
+)
+
 func (p *Package) MarkDirty()    { p.Program.markDirty(p) }
-func (p *Package) IsDirty() bool { return p.dirty }
+func (p *Package) IsDirty() bool { return (p.State & Dirty) != 0 }
 
 func (a *Program) markDirty(pkg *Package) {
-	pkg.dirty = true
+	pkg.State |= Dirty
 	if pkg.SSA != nil {
 		a.SSA.RemovePackage(pkg.SSA)
 	}
@@ -82,15 +92,9 @@ type Program struct {
 	Build        build.Context
 
 	checker *types.Config
-	Errors  TypeErrors
+	Errors  []error
 
 	logDepth int
-}
-
-type TypeErrors []types.Error
-
-func (TypeErrors) Error() string {
-	return "type errors"
 }
 
 func NewProgram() *Program {
@@ -105,7 +109,7 @@ func NewProgram() *Program {
 	}
 	a.checker.Importer = a
 	a.checker.Error = func(err error) {
-		a.Errors = append(a.Errors, err.(types.Error))
+		a.Errors = append(a.Errors, err)
 	}
 	return a
 }
@@ -131,17 +135,14 @@ func (a *Program) ImportFrom(path, srcDir string, mode types.ImportMode) (*types
 		return nil, err
 	}
 
-	if pkg, ok := a.Packages[bpkg.ImportPath]; ok && !pkg.dirty {
+	if pkg, ok := a.Packages[bpkg.ImportPath]; ok && !pkg.IsDirty() {
 		return pkg.Package, nil
 	}
 	// FIXME(dh): don't recurse forever on circular dependencies
 	pkg, err := a.compile(path, srcDir)
-	if err != nil {
-		return nil, err
-	}
 	a.Packages[bpkg.ImportPath] = pkg
 	a.TypePackages[pkg.Package] = pkg
-	return pkg.Package, nil
+	return pkg.Package, err
 }
 
 // Package returns a cached package. The result may be nil or the
@@ -154,7 +155,7 @@ func (a *Program) Package(path string) *Package {
 // cache if appropriate, or compile the package.
 func (a *Program) CompiledPackage(path string) (*Package, error) {
 	pkg, ok := a.Packages[path]
-	if ok && !pkg.dirty {
+	if ok && !pkg.IsDirty() {
 		return pkg, nil
 	}
 	return a.Compile(path)
@@ -171,23 +172,16 @@ func (a *Program) Compile(path string) (*Package, error) {
 	//
 	// TODO(dh): remove stale reverse dependencies
 
-	a.Errors = nil
 	pkg, err := a.compile(path, ".")
-	if a.Errors != nil {
-		return nil, a.Errors
-	}
-	if err != nil {
-		return nil, err
-	}
 	pkg.Explicit = true
 	a.Packages[path] = pkg
 	a.TypePackages[pkg.Package] = pkg
-	return pkg, nil
+	return pkg, err
 }
 
 func (a *Program) RecompileDirtyPackages() error {
 	for path, pkg := range a.Packages {
-		if !pkg.dirty {
+		if !pkg.IsDirty() {
 			continue
 		}
 		_, err := a.compile(path, ".")
@@ -215,13 +209,12 @@ func (a *Program) compile(path string, srcdir string) (*Package, error) {
 	// causes exponential complexity.
 	if path == "unsafe" {
 		pkg.Package = types.Unsafe
-		pkg.dirty = false
+		pkg.State &^= Dirty
 		return pkg, nil
 	}
 
 	a.markDirty(pkg)
 
-	var err error
 	build, err := a.Build.Import(path, srcdir, 0)
 	if err != nil {
 		return nil, err
@@ -237,7 +230,8 @@ func (a *Program) compile(path string, srcdir string) (*Package, error) {
 		// necessary
 		af, err := buildutil.ParseFile(a.Fset, &a.Build, nil, build.Dir, f, parser.ParseComments)
 		if err != nil {
-			return nil, err
+			pkg.Errors = append(pkg.Errors, err)
+			pkg.State |= InvalidAST
 		}
 		tf := a.Fset.File(af.Pos())
 		pkg.Files[tf] = af
@@ -246,10 +240,24 @@ func (a *Program) compile(path string, srcdir string) (*Package, error) {
 
 	pkg.Package, err = a.checker.Check(path, a.Fset, files, pkg.Info)
 	if err != nil {
-		return nil, err
+		pkg.State |= TypeError
 	}
-	pkg.SSA = a.SSA.CreatePackage(pkg.Package, files, pkg.Info, true)
-	pkg.SSA.Build()
+
+	if pkg.State == Dirty {
+		incomplete := false
+		for _, dep := range pkg.Imports() {
+			if a.TypePackages[dep].State != 0 {
+				incomplete = true
+				break
+			}
+		}
+		if !incomplete {
+			pkg.SSA = a.SSA.CreatePackage(pkg.Package, files, pkg.Info, true)
+			pkg.SSA.Build()
+		}
+	} else {
+		pkg.State |= NoSSA
+	}
 
 	for _, imp := range build.Imports {
 		// OPT(dh): we're duplicating a lot of go/build lookups
@@ -260,10 +268,15 @@ func (a *Program) compile(path string, srcdir string) (*Package, error) {
 			return nil, err
 		}
 		dep := a.Package(bdep.ImportPath)
+		if dep == nil {
+			panic(fmt.Sprintf("internal inconsistency: depdency %q of %q is missing", imp, build.ImportPath))
+		}
 		pkg.Dependencies[bdep.ImportPath] = struct{}{}
 		dep.ReverseDependencies[build.ImportPath] = struct{}{}
 	}
 
-	pkg.dirty = false
+	pkg.State &^= Dirty
+	pkg.Errors = append(pkg.Errors, a.Errors...)
+	a.Errors = nil
 	return pkg, nil
 }
