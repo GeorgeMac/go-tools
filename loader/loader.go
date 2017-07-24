@@ -39,6 +39,23 @@ type Package struct {
 	dirty bool
 }
 
+func (p *Package) MarkDirty()    { p.Program.markDirty(p) }
+func (p *Package) IsDirty() bool { return p.dirty }
+
+func (a *Program) markDirty(pkg *Package) {
+	pkg.dirty = true
+	if pkg.SSA != nil {
+		a.SSA.RemovePackage(pkg.SSA)
+	}
+	for rdep := range pkg.ReverseDependencies {
+		// the package might not be cached yet if we're currently
+		// importing its dependencies
+		if rpkg := a.Package(rdep); rpkg != nil {
+			a.markDirty(rpkg)
+		}
+	}
+}
+
 func (a *Program) newPackage() *Package {
 	return &Package{
 		Info: &types.Info{
@@ -127,8 +144,20 @@ func (a *Program) ImportFrom(path, srcDir string, mode types.ImportMode) (*types
 	return pkg.Package, nil
 }
 
+// Package returns a cached package. The result may be nil or the
+// resulting package may be marked as dirty.
 func (a *Program) Package(path string) *Package {
 	return a.Packages[path]
+}
+
+// CompilePackage returns a compiled package. It will either use the
+// cache if appropriate, or compile the package.
+func (a *Program) CompiledPackage(path string) (*Package, error) {
+	pkg, ok := a.Packages[path]
+	if ok && !pkg.dirty {
+		return pkg, nil
+	}
+	return a.Compile(path)
 }
 
 func (a *Program) Compile(path string) (*Package, error) {
@@ -154,20 +183,6 @@ func (a *Program) Compile(path string) (*Package, error) {
 	a.Packages[path] = pkg
 	a.TypePackages[pkg.Package] = pkg
 	return pkg, nil
-}
-
-func (a *Program) markDirty(pkg *Package) {
-	pkg.dirty = true
-	if pkg.SSA != nil {
-		a.SSA.RemovePackage(pkg.SSA)
-	}
-	for rdep := range pkg.ReverseDependencies {
-		// the package might not be cached yet if we're currently
-		// importing its dependencies
-		if rpkg := a.Package(rdep); rpkg != nil {
-			a.markDirty(rpkg)
-		}
-	}
 }
 
 func (a *Program) RecompileDirtyPackages() error {

@@ -127,7 +127,7 @@ func (srv *Server) position(params *lsp.TextDocumentPositionParams) (Position, e
 	if err != nil {
 		return Position{}, err
 	}
-	pkg := srv.lprog.Package(bpkg.ImportPath)
+	pkg := srv.compiledPackage(bpkg.ImportPath)
 	var tf *token.File
 	var af *ast.File
 	for _, af = range pkg.Files {
@@ -329,7 +329,7 @@ func (srv *Server) TextDocumentSymbol(params *lsp.DocumentSymbolParams) ([]lsp.S
 	if err != nil {
 		return nil, err
 	}
-	pkg := srv.lprog.Package(bpkg.ImportPath)
+	pkg := srv.compiledPackage(bpkg.ImportPath)
 
 	var info []lsp.SymbolInformation
 	type object interface {
@@ -462,14 +462,23 @@ func (srv *Server) TextDocumentHighlight(params *lsp.TextDocumentPositionParams)
 	return hls, nil
 }
 
-func (srv *Server) compilePackage(filename string) {
+func (srv *Server) markDirty(filename string) {
 	bpkg, err := buildutil.ContainingPackage(&srv.lprog.Build, ".", filename)
 	if err != nil {
 		log.Println(err)
 		return
 	}
-	_, err = srv.lprog.Compile(bpkg.ImportPath)
-	diags := []lsp.Diagnostic{}
+	log.Printf("marking %s as dirty", bpkg.ImportPath)
+	pkg := srv.lprog.Package(bpkg.ImportPath)
+	if pkg == nil {
+		return
+	}
+	pkg.MarkDirty()
+}
+
+func (srv *Server) compiledPackage(path string) *loader.Package {
+	pkg, err := srv.lprog.CompiledPackage(path)
+	diags := map[string][]lsp.Diagnostic{}
 	switch err := err.(type) {
 	case loader.TypeErrors:
 		for _, err := range err {
@@ -487,7 +496,7 @@ func (srv *Server) compilePackage(filename string) {
 				Source:   "compile",
 				Message:  err.Msg,
 			}
-			diags = append(diags, diag)
+			diags[pos.Filename] = append(diags[pos.Filename], diag)
 		}
 	case scanner.ErrorList:
 		for _, err := range err {
@@ -504,22 +513,26 @@ func (srv *Server) compilePackage(filename string) {
 				Source:   "compile",
 				Message:  err.Msg,
 			}
-			diags = append(diags, diag)
+			diags[err.Pos.Filename] = append(diags[err.Pos.Filename], diag)
 		}
 	case nil:
 	default:
-		log.Println(err)
-		return
+		panic(fmt.Sprintf("unexpected error type %T", err))
 	}
-	// XXX handle assigning diags to files
-	params := lsp.PublishDiagnosticsParams{
-		URI: &lsp.URI{
-			Scheme: "file",
-			Path:   filename,
-		},
-		Diagnostics: diags,
+
+	for file, diags := range diags {
+		params := lsp.PublishDiagnosticsParams{
+			URI: &lsp.URI{
+				Scheme: "file",
+				Path:   file,
+			},
+			Diagnostics: diags,
+		}
+		srv.Notify("textDocument/publishDiagnostics", params)
 	}
-	srv.Notify("textDocument/publishDiagnostics", params)
+	// XXX by only pushing diagnostics for files with errors we're
+	// failing to clear errors from error-free files.
+	return pkg
 }
 
 func (srv *Server) Initialize(params *lsp.InitializeParams) (*lsp.InitializeResult, error) {
@@ -541,12 +554,12 @@ func (srv *Server) Initialize(params *lsp.InitializeParams) (*lsp.InitializeResu
 
 func (srv *Server) TextDocumentDidOpen(params *lsp.DidOpenTextDocumentParams) {
 	srv.overlay[params.TextDocument.URI.Path] = []byte(params.TextDocument.Text)
-	srv.compilePackage(params.TextDocument.URI.Path)
+	srv.markDirty(params.TextDocument.URI.Path)
 }
 
 func (srv *Server) TextDocumentDidChange(params *lsp.DidChangeTextDocumentParams) {
 	srv.overlay[params.TextDocument.URI.Path] = []byte(params.ContentChanges[0].Text)
-	srv.compilePackage(params.TextDocument.URI.Path)
+	srv.markDirty(params.TextDocument.URI.Path)
 }
 
 func (srv *Server) TextDocumentHover(params *lsp.TextDocumentPositionParams) (*lsp.Hover, error) {
