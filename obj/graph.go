@@ -24,8 +24,6 @@ import (
 // OPT(dh): optimize calculation of IDs (use byte slices and in-place
 // modifications instead of all the Sprintf calls)
 
-// OPT(dh): store UUIDs as raw bytes, not as their string representation
-
 // OPT(dh): use batch sets when inserting data
 
 // TODO(dh): add index mapping package names to import pathscd
@@ -100,8 +98,8 @@ func (g *Graph) InsertPackage(pkg *types.Package) {
 	g.kv.Set(key, id, 0)
 }
 
-func (g *Graph) encodeScope(pkg *types.Package, scope *types.Scope) uuid.UUID {
-	id := uuid.NewV1()
+func (g *Graph) encodeScope(pkg *types.Package, scope *types.Scope) [16]byte {
+	id := [16]byte(uuid.NewV1())
 
 	var args [][]byte
 
@@ -161,7 +159,7 @@ func (g *Graph) encodeObject(obj types.Object) {
 	}
 	id := uuid.NewV1()
 	path := obj.Pkg().Path()
-	key := []byte(fmt.Sprintf("pkgs/%s\x00objects/%s", path, id))
+	key := []byte(fmt.Sprintf("pkgs/%s\x00objects/%s", path, [16]byte(id)))
 	g.objToID[obj] = key
 
 	g.encodeType(obj.Type())
@@ -208,7 +206,7 @@ func (g *Graph) encodeObject(obj types.Object) {
 		)
 	}
 
-	g.kv.Set(key, []byte(v), 0)
+	g.kv.Set(key, v, 0)
 }
 
 func encodeBytes(vs ...[]byte) []byte {
@@ -233,7 +231,7 @@ func (g *Graph) encodeType(T types.Type) {
 		return
 	}
 	id := uuid.NewV1()
-	key := []byte(fmt.Sprintf("types/%s", id))
+	key := []byte(fmt.Sprintf("types/%s", [16]byte(id)))
 	g.typToID.Set(T, key)
 
 	switch T := T.(type) {
