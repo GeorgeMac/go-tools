@@ -2,10 +2,8 @@ package obj
 
 import (
 	"encoding/binary"
-	"encoding/hex"
 	"fmt"
 	"go/types"
-	"log"
 	"reflect"
 
 	"honnef.co/go/tools/typeutil"
@@ -13,8 +11,6 @@ import (
 	"github.com/dgraph-io/badger"
 	uuid "github.com/satori/go.uuid"
 )
-
-// OPT(dh): use enums instead of strings for object/type kinds
 
 // OPT(dh): in types with elems like slices, consider storing the
 // concrete underlying type together with the type ID, so that we can
@@ -136,6 +132,25 @@ func (g *Graph) encodeScope(pkg *types.Package, scope *types.Scope) uuid.UUID {
 	return id
 }
 
+const (
+	kindFunc = iota
+	kindVar
+	kindTypename
+	kindConst
+	kindPkgname
+
+	kindSignature
+	kindNamed
+	kindSlice
+	kindPointer
+	kindInterface
+	kindArray
+	kindStruct
+	kindTuple
+	kindMap
+	kindChan
+)
+
 func (g *Graph) encodeObject(obj types.Object) {
 	if _, ok := g.objToID[obj]; ok {
 		return
@@ -150,36 +165,47 @@ func (g *Graph) encodeObject(obj types.Object) {
 	g.objToID[obj] = key
 
 	g.encodeType(obj.Type())
-	typID := g.typToID.At(obj.Type())
-	typ := ""
+	typID := g.typToID.At(obj.Type()).([]byte)
+	var typ byte
 	switch obj.(type) {
 	case *types.Func:
-		typ = "func"
+		typ = kindFunc
 	case *types.Var:
-		typ = "var"
+		typ = kindVar
 	case *types.TypeName:
-		typ = "typename"
+		typ = kindTypename
 	case *types.Const:
-		typ = "const"
+		typ = kindConst
 	case *types.PkgName:
-		typ = "pkgname"
+		typ = kindPkgname
 	default:
-		log.Println(obj, obj.Pkg())
 		panic(fmt.Sprintf("%T", obj))
 	}
 
-	// OPT(dh): don't use Sprintf
-	var v string
+	var v []byte
 	switch obj := obj.(type) {
 	case *types.PkgName:
-		v = fmt.Sprintf("%s\x00%s\x00%s\x00%s", obj.Name(), typ, typID, obj.Imported().Path())
+		v = encodeBytes(
+			[]byte(obj.Name()),
+			[]byte{typ},
+			typID,
+			[]byte(obj.Imported().Path()),
+		)
 	case *types.Const:
 		kind, data := encodeConstant(reflect.ValueOf(obj.Val()))
-		// OPT(dh): encode data raw, not in base 16. We're currently
-		// doing it because null bytes act as field separators.
-		v = fmt.Sprintf("%s\x00%s\x00%s\x00%c\x00%s", obj.Name(), typ, typID, kind, hex.EncodeToString(data))
+		v = encodeBytes(
+			[]byte(obj.Name()),
+			[]byte{typ},
+			typID,
+			[]byte{kind},
+			data,
+		)
 	default:
-		v = fmt.Sprintf("%s\x00%s\x00%s", obj.Name(), typ, typID)
+		v = encodeBytes(
+			[]byte(obj.Name()),
+			[]byte{typ},
+			typID,
+		)
 	}
 
 	g.kv.Set(key, []byte(v), 0)
@@ -227,7 +253,7 @@ func (g *Graph) encodeType(T types.Type) {
 		recv := g.objToID[T.Recv()]
 
 		v := encodeBytes(
-			[]byte("signature"),
+			[]byte{kindSignature},
 			params,
 			results,
 			recv,
@@ -237,7 +263,7 @@ func (g *Graph) encodeType(T types.Type) {
 		g.kv.Set(key, v, 0)
 	case *types.Named:
 		var args [][]byte
-		args = append(args, []byte("named"))
+		args = append(args, []byte{kindNamed})
 
 		underlying := T.Underlying()
 		g.encodeType(underlying)
@@ -258,7 +284,7 @@ func (g *Graph) encodeType(T types.Type) {
 		elem := T.Elem()
 		g.encodeType(elem)
 		v := encodeBytes(
-			[]byte("slice"),
+			[]byte{kindSlice},
 			g.typToID.At(elem).([]byte),
 		)
 		g.kv.Set(key, v, 0)
@@ -266,13 +292,13 @@ func (g *Graph) encodeType(T types.Type) {
 		elem := T.Elem()
 		g.encodeType(elem)
 		v := encodeBytes(
-			[]byte("pointer"),
+			[]byte{kindPointer},
 			g.typToID.At(elem).([]byte),
 		)
 		g.kv.Set(key, v, 0)
 	case *types.Interface:
 		var args [][]byte
-		args = append(args, []byte("interface"))
+		args = append(args, []byte{kindInterface})
 
 		n := make([]byte, 8)
 		binary.LittleEndian.PutUint64(n, uint64(T.NumExplicitMethods()))
@@ -302,14 +328,14 @@ func (g *Graph) encodeType(T types.Type) {
 		n := make([]byte, 8)
 		binary.LittleEndian.PutUint64(n, uint64(T.Len()))
 		v := encodeBytes(
-			[]byte("array"),
+			[]byte{kindArray},
 			g.typToID.At(elem).([]byte),
 			n,
 		)
 		g.kv.Set(key, v, 0)
 	case *types.Struct:
 		var args [][]byte
-		args = append(args, []byte("struct"))
+		args = append(args, []byte{kindStruct})
 		for i := 0; i < T.NumFields(); i++ {
 			field := T.Field(i)
 			tag := T.Tag(i)
@@ -322,7 +348,7 @@ func (g *Graph) encodeType(T types.Type) {
 		g.kv.Set(key, v, 0)
 	case *types.Tuple:
 		var args [][]byte
-		args = append(args, []byte("tuple"))
+		args = append(args, []byte{kindTuple})
 		for i := 0; i < T.Len(); i++ {
 			v := T.At(i)
 			g.encodeObject(v)
@@ -334,7 +360,7 @@ func (g *Graph) encodeType(T types.Type) {
 		g.encodeType(T.Key())
 		g.encodeType(T.Elem())
 		v := encodeBytes(
-			[]byte("map"),
+			[]byte{kindMap},
 			g.typToID.At(T.Key()).([]byte),
 			g.typToID.At(T.Elem()).([]byte),
 		)
@@ -343,7 +369,7 @@ func (g *Graph) encodeType(T types.Type) {
 		g.encodeType(T.Elem())
 
 		v := encodeBytes(
-			[]byte("chan"),
+			[]byte{kindChan},
 			g.typToID.At(T.Elem()).([]byte),
 			[]byte{byte(T.Dir())},
 		)

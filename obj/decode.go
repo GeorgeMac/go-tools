@@ -112,24 +112,24 @@ func (g *Graph) decodeObjectItem(item *badger.KVItem, pkg *types.Package) (ret t
 		g.idToObj[string(key)] = ret
 	}()
 
-	vals := bytes.Split(item.Value(), []byte{'\x00'})
-	name, typ, typID := string(vals[0]), string(vals[1]), vals[2]
+	vals := decodeBytes(item.Value())
+	name, typ, typID := string(vals[0]), vals[1], vals[2]
 
 	T := g.decodeType(typID)
-	switch typ {
-	case "func":
+	switch typ[0] {
+	case kindFunc:
 		// XXX do scope
 		return types.NewFunc(0, pkg, name, T.(*types.Signature))
-	case "var":
+	case kindVar:
 		return types.NewVar(0, pkg, name, T)
-	case "typename":
+	case kindTypename:
 		return types.NewTypeName(0, pkg, name, T)
-	case "const":
+	case kindConst:
 		kind := vals[3][0]
 		data := vals[4]
 		val := decodeConstant2(kind, data)
 		return types.NewConst(0, pkg, name, T, val)
-	case "pkgname":
+	case kindPkgname:
 		path := vals[3]
 		return types.NewPkgName(0, pkg, name, g.Package(string(path)))
 	default:
@@ -196,8 +196,8 @@ func (g *Graph) decodeType(id []byte) types.Type {
 	g.kv.Get(id, &item)
 
 	vals := decodeBytes(item.Value())
-	switch string(vals[0]) {
-	case "signature":
+	switch vals[0][0] {
+	case kindSignature:
 		T := new(types.Signature)
 		g.idToTyp[string(id)] = T
 
@@ -216,7 +216,7 @@ func (g *Graph) decodeType(id []byte) types.Type {
 		*T = *types.NewSignature(recv, params, results, variadic)
 
 		return T
-	case "tuple":
+	case kindTuple:
 		T := new(types.Tuple)
 		g.idToTyp[string(id)] = T
 
@@ -229,7 +229,7 @@ func (g *Graph) decodeType(id []byte) types.Type {
 			*T = *types.NewTuple(vars...)
 		}
 		return T
-	case "named":
+	case kindNamed:
 		T := new(types.Named)
 		g.idToTyp[string(id)] = T
 
@@ -246,7 +246,7 @@ func (g *Graph) decodeType(id []byte) types.Type {
 
 		*T = *types.NewNamed(obj, underlying, fns)
 		return T
-	case "struct":
+	case kindStruct:
 		T := new(types.Struct)
 		g.idToTyp[string(id)] = T
 
@@ -265,7 +265,7 @@ func (g *Graph) decodeType(id []byte) types.Type {
 
 		*T = *types.NewStruct(fields, tags)
 		return T
-	case "interface":
+	case kindInterface:
 		T := new(types.Interface)
 		g.idToTyp[string(id)] = T
 
@@ -288,7 +288,7 @@ func (g *Graph) decodeType(id []byte) types.Type {
 		*T = *types.NewInterface(fns, embeddeds)
 		T.Complete()
 		return T
-	case "pointer":
+	case kindPointer:
 		T := new(types.Pointer)
 		g.idToTyp[string(id)] = T
 
@@ -296,7 +296,7 @@ func (g *Graph) decodeType(id []byte) types.Type {
 		*T = *types.NewPointer(elem)
 
 		return T
-	case "slice":
+	case kindSlice:
 		T := new(types.Slice)
 		g.idToTyp[string(id)] = T
 
@@ -304,7 +304,7 @@ func (g *Graph) decodeType(id []byte) types.Type {
 		*T = *types.NewSlice(elem)
 
 		return T
-	case "map":
+	case kindMap:
 		T := new(types.Map)
 		g.idToTyp[string(id)] = T
 
@@ -313,7 +313,7 @@ func (g *Graph) decodeType(id []byte) types.Type {
 		*T = *types.NewMap(key, elem)
 
 		return T
-	case "chan":
+	case kindChan:
 		T := new(types.Chan)
 		g.idToTyp[string(id)] = T
 
@@ -322,7 +322,7 @@ func (g *Graph) decodeType(id []byte) types.Type {
 		*T = *types.NewChan(types.ChanDir(dir), elem)
 
 		return T
-	case "array":
+	case kindArray:
 		T := new(types.Array)
 		g.idToTyp[string(id)] = T
 
