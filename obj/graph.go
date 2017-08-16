@@ -1,12 +1,12 @@
 package obj
 
 import (
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"go/types"
 	"log"
 	"reflect"
-	"strconv"
 
 	"honnef.co/go/tools/typeutil"
 
@@ -15,12 +15,6 @@ import (
 )
 
 // OPT(dh): use enums instead of strings for object/type kinds
-
-// OPT(dh): precompute aggregates. e.g., instead of having to query
-// 4-8 keys for a single key, query one key that contains a binary
-// blob.
-
-// OPT(dh): deduplicate types
 
 // OPT(dh): in types with elems like slices, consider storing the
 // concrete underlying type together with the type ID, so that we can
@@ -185,6 +179,17 @@ func (g *Graph) encodeObject(obj types.Object) {
 	g.kv.Set(key, []byte(v), 0)
 }
 
+func encodeBytes(vs ...[]byte) []byte {
+	var out []byte
+	num := make([]byte, 4)
+	for _, v := range vs {
+		binary.LittleEndian.PutUint32(num, uint32(len(v)))
+		out = append(out, num...)
+		out = append(out, v...)
+	}
+	return out
+}
+
 func (g *Graph) encodeType(T types.Type) {
 	if id := g.typToID.At(T); id != nil {
 		return
@@ -199,146 +204,148 @@ func (g *Graph) encodeType(T types.Type) {
 	key := []byte(fmt.Sprintf("types/%s", id))
 	g.typToID.Set(T, key)
 
-	typ := ""
 	switch T := T.(type) {
 	case *types.Signature:
-		typ = "signature"
-
 		g.encodeType(T.Params())
 		g.encodeType(T.Results())
 		if T.Recv() != nil {
 			g.encodeObject(T.Recv())
 		}
 
-		key = []byte(fmt.Sprintf("types/%s/params", id))
-		g.kv.Set(key, g.typToID.At(T.Params()).([]byte), 0)
-		key = []byte(fmt.Sprintf("types/%s/results", id))
-		g.kv.Set(key, g.typToID.At(T.Results()).([]byte), 0)
-		if T.Recv() != nil {
-			key = []byte(fmt.Sprintf("types/%s/recv", id))
-			g.kv.Set(key, g.objToID[T.Recv()], 0)
-		}
-		key = []byte(fmt.Sprintf("types/%s/variadic", id))
+		variadic := byte(0)
 		if T.Variadic() {
-			g.kv.Set(key, []byte{1}, 0)
-		} else {
-			// OPT(dh): don't store variadic if it's false
-			g.kv.Set(key, []byte{0}, 0)
+			variadic = 1
 		}
+		params := g.typToID.At(T.Params()).([]byte)
+		results := g.typToID.At(T.Results()).([]byte)
+		recv := g.objToID[T.Recv()]
+
+		v := encodeBytes(
+			[]byte("signature"),
+			params,
+			results,
+			recv,
+			[]byte{variadic},
+		)
+
+		g.kv.Set(key, v, 0)
 	case *types.Named:
-		typ = "named"
+		var args [][]byte
+		args = append(args, []byte("named"))
 
 		underlying := T.Underlying()
 		g.encodeType(underlying)
-		key = []byte(fmt.Sprintf("types/%s/underlying", id))
-		g.kv.Set(key, g.typToID.At(underlying).([]byte), 0)
+		args = append(args, g.typToID.At(underlying).([]byte))
 
 		typename := T.Obj()
 		g.encodeObject(typename)
-		key = []byte(fmt.Sprintf("types/%s/obj", id))
-		g.kv.Set(key, g.objToID[typename], 0)
+		args = append(args, g.objToID[typename])
 
 		for i := 0; i < T.NumMethods(); i++ {
 			fn := T.Method(i)
 			g.encodeObject(fn)
-			// OPT(dh): store index as raw bytes
-			key = []byte(fmt.Sprintf("types/%s/method/%d", id, i))
-			g.kv.Set(key, g.objToID[fn], 0)
+			args = append(args, g.objToID[fn])
 		}
+		v := encodeBytes(args...)
+		g.kv.Set(key, v, 0)
 	case *types.Slice:
-		typ = "slice"
 		elem := T.Elem()
 		g.encodeType(elem)
-		key = []byte(fmt.Sprintf("types/%s/elem", id))
-		g.kv.Set(key, g.typToID.At(elem).([]byte), 0)
+		v := encodeBytes(
+			[]byte("slice"),
+			g.typToID.At(elem).([]byte),
+		)
+		g.kv.Set(key, v, 0)
 	case *types.Pointer:
-		typ = "pointer"
 		elem := T.Elem()
 		g.encodeType(elem)
-		key = []byte(fmt.Sprintf("types/%s/elem", id))
-		g.kv.Set(key, g.typToID.At(elem).([]byte), 0)
+		v := encodeBytes(
+			[]byte("pointer"),
+			g.typToID.At(elem).([]byte),
+		)
+		g.kv.Set(key, v, 0)
 	case *types.Interface:
-		typ = "interface"
+		var args [][]byte
+		args = append(args, []byte("interface"))
+
+		n := make([]byte, 8)
+		binary.LittleEndian.PutUint64(n, uint64(T.NumExplicitMethods()))
+		args = append(args, n)
 
 		for i := 0; i < T.NumExplicitMethods(); i++ {
 			fn := T.ExplicitMethod(i)
 			g.encodeObject(fn)
-			// OPT(dh): store index as bytes
-			key = []byte(fmt.Sprintf("types/%s/method/%d", id, i))
-			g.kv.Set(key, g.objToID[fn], 0)
+			args = append(args, g.objToID[fn])
 		}
+
+		n = make([]byte, 8)
+		binary.LittleEndian.PutUint64(n, uint64(T.NumEmbeddeds()))
+		args = append(args, n)
 
 		for i := 0; i < T.NumEmbeddeds(); i++ {
 			embedded := T.Embedded(i)
 			g.encodeType(embedded)
-			// OPT(dh): store index as bytes
-			key = []byte(fmt.Sprintf("types/%s/embedded/%d", id, i))
-			g.kv.Set(key, g.typToID.At(embedded).([]byte), 0)
+			args = append(args, g.typToID.At(embedded).([]byte))
 		}
+		v := encodeBytes(args...)
+		g.kv.Set(key, v, 0)
 	case *types.Array:
-		typ = "array"
-
 		elem := T.Elem()
 		g.encodeType(elem)
-		key = []byte(fmt.Sprintf("types/%s/elem", id))
-		g.kv.Set(key, g.typToID.At(elem).([]byte), 0)
 
-		n := T.Len()
-		key = []byte(fmt.Sprintf("types/%s/len", id))
-		// OPT(dh): store the number as raw bytes, not ASCII. We're
-		// using ASCII here to make debugging easier.
-		g.kv.Set(key, []byte(strconv.Itoa(int(n))), 0)
+		n := make([]byte, 8)
+		binary.LittleEndian.PutUint64(n, uint64(T.Len()))
+		v := encodeBytes(
+			[]byte("array"),
+			g.typToID.At(elem).([]byte),
+			n,
+		)
+		g.kv.Set(key, v, 0)
 	case *types.Struct:
-		typ = "struct"
-
+		var args [][]byte
+		args = append(args, []byte("struct"))
 		for i := 0; i < T.NumFields(); i++ {
 			field := T.Field(i)
 			tag := T.Tag(i)
 			g.encodeObject(field)
 
-			// OPT(dh): store index as bytes
-			key = []byte(fmt.Sprintf("types/%s/field/%d", id, i))
-			g.kv.Set(key, g.objToID[field], 0)
-
-			// OPT(dh): store index as bytes
-			// OPT(dh): don't store empty tags
-			key = []byte(fmt.Sprintf("types/%s/tag/%d", id, i))
-			g.kv.Set(key, []byte(tag), 0)
+			args = append(args, g.objToID[field])
+			args = append(args, []byte(tag))
 		}
+		v := encodeBytes(args...)
+		g.kv.Set(key, v, 0)
 	case *types.Tuple:
-		typ = "tuple"
-
+		var args [][]byte
+		args = append(args, []byte("tuple"))
 		for i := 0; i < T.Len(); i++ {
 			v := T.At(i)
 			g.encodeObject(v)
-			// OPT(dh): store index as bytes
-			key = []byte(fmt.Sprintf("types/%s/item/%d", id, i))
-			g.kv.Set(key, g.objToID[v], 0)
+			args = append(args, g.objToID[v])
 		}
+		v := encodeBytes(args...)
+		g.kv.Set(key, v, 0)
 	case *types.Map:
-		typ = "map"
-
 		g.encodeType(T.Key())
 		g.encodeType(T.Elem())
-		key := []byte(fmt.Sprintf("types/%s/key", id))
-		g.kv.Set(key, g.typToID.At(T.Key()).([]byte), 0)
-		key = []byte(fmt.Sprintf("types/%s/elem", id))
-		g.kv.Set(key, g.typToID.At(T.Elem()).([]byte), 0)
-
+		v := encodeBytes(
+			[]byte("map"),
+			g.typToID.At(T.Key()).([]byte),
+			g.typToID.At(T.Elem()).([]byte),
+		)
+		g.kv.Set(key, v, 0)
 	case *types.Chan:
-		typ = "chan"
-
 		g.encodeType(T.Elem())
-		key = []byte(fmt.Sprintf("types/%s/elem", id))
-		g.kv.Set(key, g.typToID.At(T.Elem()).([]byte), 0)
 
-		key = []byte(fmt.Sprintf("types/%s/dir", id))
-		g.kv.Set(key, []byte{byte(T.Dir())}, 0)
+		v := encodeBytes(
+			[]byte("chan"),
+			g.typToID.At(T.Elem()).([]byte),
+			[]byte{byte(T.Dir())},
+		)
+
+		g.kv.Set(key, v, 0)
 	default:
 		panic(fmt.Sprintf("%T", T))
 	}
-	key = []byte(fmt.Sprintf("types/%s/type", id))
-	g.kv.Set(key, []byte(typ), 0)
 }
 
 func (g *Graph) Close() error {

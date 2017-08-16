@@ -2,11 +2,9 @@ package obj
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"go/types"
-	"strconv"
-
-	"honnef.co/go/spew"
 
 	"github.com/dgraph-io/badger"
 )
@@ -159,6 +157,19 @@ var builtins = map[string]*types.Basic{
 	"untyped nil":     types.Typ[types.UntypedNil],
 }
 
+func decodeBytes(b []byte) [][]byte {
+	var out [][]byte
+	for {
+		if len(b) == 0 {
+			break
+		}
+		n := binary.LittleEndian.Uint32(b)
+		out = append(out, b[4:4+n])
+		b = b[4+n:]
+	}
+	return out
+}
+
 func (g *Graph) decodeType(id []byte) types.Type {
 	if T, ok := g.idToTyp[string(id)]; ok {
 		return T
@@ -168,31 +179,28 @@ func (g *Graph) decodeType(id []byte) types.Type {
 		return builtins[string(id[len("builtin/"):])]
 	}
 
+	var item badger.KVItem
 	// XXX verify that key exists
-	it := g.kv.NewIterator(badger.DefaultIteratorOptions)
-	defer it.Close()
-	// OPT(dh): use a struct (union of all fields) instead of a map
-	m := map[string]string{}
-	for it.Seek(id); it.ValidForPrefix(id); it.Next() {
-		item := it.Item()
-		idx := bytes.LastIndex(item.Key(), []byte{'/'})
-		key := item.Key()[idx+1:]
+	g.kv.Get(id, &item)
 
-		m[string(key)] = string(item.Value())
-	}
-
-	switch m["type"] {
+	vals := decodeBytes(item.Value())
+	switch string(vals[0]) {
 	case "signature":
 		T := new(types.Signature)
 		g.idToTyp[string(id)] = T
 
+		vparams := vals[1]
+		vresults := vals[2]
+		vrecv := vals[3]
+		vvariadic := vals[4]
+
 		var recv *types.Var
-		if m["recv"] != "" {
-			recv = g.decodeObject([]byte(m["recv"])).(*types.Var)
+		if len(vrecv) != 0 {
+			recv = g.decodeObject(vrecv).(*types.Var)
 		}
-		params := g.decodeType([]byte(m["params"])).(*types.Tuple)
-		results := g.decodeType([]byte(m["results"])).(*types.Tuple)
-		variadic := m["variadic"] != "\x00"
+		params := g.decodeType(vparams).(*types.Tuple)
+		results := g.decodeType(vresults).(*types.Tuple)
+		variadic := vvariadic[0] != 0
 		*T = *types.NewSignature(recv, params, results, variadic)
 
 		return T
@@ -200,13 +208,9 @@ func (g *Graph) decodeType(id []byte) types.Type {
 		T := new(types.Tuple)
 		g.idToTyp[string(id)] = T
 
-		prefix := []byte(fmt.Sprintf("%s/item/", id))
-		// OPT(dh): we don't need to ierate a second time, the first
-		// iterator collects all the keys already
 		var vars []*types.Var
-		it.Rewind()
-		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-			vars = append(vars, g.decodeObject(it.Item().Value()).(*types.Var))
+		for _, val := range vals[1:] {
+			vars = append(vars, g.decodeObject(val).(*types.Var))
 		}
 
 		if len(vars) > 0 {
@@ -217,15 +221,17 @@ func (g *Graph) decodeType(id []byte) types.Type {
 		T := new(types.Named)
 		g.idToTyp[string(id)] = T
 
-		obj := g.decodeObject([]byte(m["obj"])).(*types.TypeName)
-		underlying := g.decodeType([]byte(m["underlying"]))
-		prefix := []byte(fmt.Sprintf("%s/method/", id))
-		// OPT(dh): we don't need to iterate a second time, the first
+		vunderlying := vals[1]
+		vobj := vals[2]
+
+		obj := g.decodeObject(vobj).(*types.TypeName)
+		underlying := g.decodeType(vunderlying)
+
 		var fns []*types.Func
-		it.Rewind()
-		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-			fns = append(fns, g.decodeObject(it.Item().Value()).(*types.Func))
+		for _, val := range vals[3:] {
+			fns = append(fns, g.decodeObject(val).(*types.Func))
 		}
+
 		*T = *types.NewNamed(obj, underlying, fns)
 		return T
 	case "struct":
@@ -235,20 +241,14 @@ func (g *Graph) decodeType(id []byte) types.Type {
 		var fields []*types.Var
 		var tags []string
 
-		prefix := []byte(fmt.Sprintf("%s/field/", id))
-		// OPT(dh): we don't need to iterate a second time, the first
-		// iterator collects all the keys already
-		it.Rewind()
-		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-			fields = append(fields, g.decodeObject(it.Item().Value()).(*types.Var))
-		}
+		if len(vals) > 1 {
+			for i := 1; i < len(vals); i += 2 {
+				field := vals[i]
+				tag := vals[i+1]
 
-		prefix = []byte(fmt.Sprintf("%s/tag/", id))
-		// OPT(dh): we don't need to iterate a second time, the first
-		// iterator collects all the keys already
-		it.Rewind()
-		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-			tags = append(tags, string(it.Item().Value()))
+				fields = append(fields, g.decodeObject(field).(*types.Var))
+				tags = append(tags, string(tag))
+			}
 		}
 
 		*T = *types.NewStruct(fields, tags)
@@ -260,20 +260,17 @@ func (g *Graph) decodeType(id []byte) types.Type {
 		var fns []*types.Func
 		var embeddeds []*types.Named
 
-		prefix := []byte(fmt.Sprintf("%s/method/", id))
-		// OPT(dh): we don't need iterate a second time, the first
-		// iterator collects all the keys already
-		it.Rewind()
-		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-			fns = append(fns, g.decodeObject(it.Item().Value()).(*types.Func))
+		n := binary.LittleEndian.Uint64(vals[1])
+		vals = vals[2:]
+		for i := uint64(0); i < n; i++ {
+			fns = append(fns, g.decodeObject(vals[i]).(*types.Func))
 		}
 
-		prefix = []byte(fmt.Sprintf("%s/embedded/", id))
-		// OPT(dh): we don't need to iterate a second time, the first
-		// iterator collects all the keys already
-		it.Rewind()
-		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-			embeddeds = append(embeddeds, g.decodeType(it.Item().Value()).(*types.Named))
+		vals = vals[n:]
+		n = binary.LittleEndian.Uint64(vals[0])
+		vals = vals[1:]
+		for i := uint64(0); i < n; i++ {
+			embeddeds = append(embeddeds, g.decodeType(vals[i]).(*types.Named))
 		}
 
 		*T = *types.NewInterface(fns, embeddeds)
@@ -283,7 +280,7 @@ func (g *Graph) decodeType(id []byte) types.Type {
 		T := new(types.Pointer)
 		g.idToTyp[string(id)] = T
 
-		elem := g.decodeType([]byte(m["elem"]))
+		elem := g.decodeType([]byte(vals[1]))
 		*T = *types.NewPointer(elem)
 
 		return T
@@ -291,7 +288,7 @@ func (g *Graph) decodeType(id []byte) types.Type {
 		T := new(types.Slice)
 		g.idToTyp[string(id)] = T
 
-		elem := g.decodeType([]byte(m["elem"]))
+		elem := g.decodeType([]byte(vals[1]))
 		*T = *types.NewSlice(elem)
 
 		return T
@@ -299,8 +296,8 @@ func (g *Graph) decodeType(id []byte) types.Type {
 		T := new(types.Map)
 		g.idToTyp[string(id)] = T
 
-		key := g.decodeType([]byte(m["key"]))
-		elem := g.decodeType([]byte(m["elem"]))
+		key := g.decodeType([]byte(vals[1]))
+		elem := g.decodeType([]byte(vals[2]))
 		*T = *types.NewMap(key, elem)
 
 		return T
@@ -308,8 +305,8 @@ func (g *Graph) decodeType(id []byte) types.Type {
 		T := new(types.Chan)
 		g.idToTyp[string(id)] = T
 
-		elem := g.decodeType([]byte(m["elem"]))
-		dir := m["dir"][0]
+		elem := g.decodeType(vals[1])
+		dir := vals[2][0]
 		*T = *types.NewChan(types.ChanDir(dir), elem)
 
 		return T
@@ -317,13 +314,12 @@ func (g *Graph) decodeType(id []byte) types.Type {
 		T := new(types.Array)
 		g.idToTyp[string(id)] = T
 
-		elem := g.decodeType([]byte(m["elem"]))
-		n, _ := strconv.Atoi(m["len"])
+		elem := g.decodeType(vals[1])
+		n := binary.LittleEndian.Uint64(vals[2])
 		*T = *types.NewArray(elem, int64(n))
 
 		return T
 	default:
-		spew.Dump(m)
-		panic(m["type"])
+		panic(string(vals[0]))
 	}
 }
