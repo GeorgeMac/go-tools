@@ -42,6 +42,7 @@ type Graph struct {
 	pkgs map[string]*types.Package
 
 	scopes map[*types.Package]map[string][]byte
+	set    []*badger.Entry
 }
 
 func OpenGraph(dir string) (*Graph, error) {
@@ -84,18 +85,21 @@ func (g *Graph) InsertPackage(pkg *types.Package) {
 	}
 	g.pkgs[pkg.Path()] = pkg
 
+	g.set = []*badger.Entry{}
 	for _, imp := range pkg.Imports() {
-		key := fmt.Sprintf("pkgs/%s\x00imports/%s", pkg.Path(), imp.Path())
-		g.kv.Set([]byte(key), nil, 0)
-		g.InsertPackage(imp)
+		key := []byte(fmt.Sprintf("pkgs/%s\x00imports/%s", pkg.Path(), imp.Path()))
+		g.set = badger.EntriesSet(g.set, key, nil)
 	}
 
 	key := []byte(fmt.Sprintf("pkgs/%s\x00name", pkg.Path()))
-	g.kv.Set(key, []byte(pkg.Name()), 0)
+	g.set = badger.EntriesSet(g.set, key, []byte(pkg.Name()))
 
 	id := []byte(fmt.Sprintf("pkgs/%s\x00scopes/%s", pkg.Path(), g.encodeScope(pkg, pkg.Scope())))
 	key = []byte(fmt.Sprintf("pkgs/%s\x00scope", pkg.Path()))
-	g.kv.Set(key, id, 0)
+	g.set = badger.EntriesSet(g.set, key, id)
+
+	g.kv.BatchSet(g.set)
+	g.set = nil
 }
 
 func (g *Graph) encodeScope(pkg *types.Package, scope *types.Scope) [16]byte {
@@ -127,7 +131,7 @@ func (g *Graph) encodeScope(pkg *types.Package, scope *types.Scope) [16]byte {
 
 	v := encodeBytes(args...)
 	key := []byte(fmt.Sprintf("pkgs/%s\x00scopes/%s", pkg.Path(), id))
-	g.kv.Set(key, v, 0)
+	g.set = badger.EntriesSet(g.set, key, v)
 
 	return id
 }
@@ -208,7 +212,7 @@ func (g *Graph) encodeObject(obj types.Object) {
 		)
 	}
 
-	g.kv.Set(key, v, 0)
+	g.set = badger.EntriesSet(g.set, key, v)
 }
 
 func encodeBytes(vs ...[]byte) []byte {
@@ -260,7 +264,7 @@ func (g *Graph) encodeType(T types.Type) {
 			[]byte{variadic},
 		)
 
-		g.kv.Set(key, v, 0)
+		g.set = badger.EntriesSet(g.set, key, v)
 	case *types.Named:
 		var args [][]byte
 		args = append(args, []byte{kindNamed})
@@ -279,7 +283,7 @@ func (g *Graph) encodeType(T types.Type) {
 			args = append(args, g.objToID[fn])
 		}
 		v := encodeBytes(args...)
-		g.kv.Set(key, v, 0)
+		g.set = badger.EntriesSet(g.set, key, v)
 	case *types.Slice:
 		elem := T.Elem()
 		g.encodeType(elem)
@@ -287,7 +291,7 @@ func (g *Graph) encodeType(T types.Type) {
 			[]byte{kindSlice},
 			g.typToID.At(elem).([]byte),
 		)
-		g.kv.Set(key, v, 0)
+		g.set = badger.EntriesSet(g.set, key, v)
 	case *types.Pointer:
 		elem := T.Elem()
 		g.encodeType(elem)
@@ -295,7 +299,7 @@ func (g *Graph) encodeType(T types.Type) {
 			[]byte{kindPointer},
 			g.typToID.At(elem).([]byte),
 		)
-		g.kv.Set(key, v, 0)
+		g.set = badger.EntriesSet(g.set, key, v)
 	case *types.Interface:
 		var args [][]byte
 		args = append(args, []byte{kindInterface})
@@ -320,7 +324,7 @@ func (g *Graph) encodeType(T types.Type) {
 			args = append(args, g.typToID.At(embedded).([]byte))
 		}
 		v := encodeBytes(args...)
-		g.kv.Set(key, v, 0)
+		g.set = badger.EntriesSet(g.set, key, v)
 	case *types.Array:
 		elem := T.Elem()
 		g.encodeType(elem)
@@ -333,7 +337,7 @@ func (g *Graph) encodeType(T types.Type) {
 			g.typToID.At(elem).([]byte),
 			n,
 		)
-		g.kv.Set(key, v, 0)
+		g.set = badger.EntriesSet(g.set, key, v)
 	case *types.Struct:
 		var args [][]byte
 		args = append(args, []byte{kindStruct})
@@ -346,7 +350,7 @@ func (g *Graph) encodeType(T types.Type) {
 			args = append(args, []byte(tag))
 		}
 		v := encodeBytes(args...)
-		g.kv.Set(key, v, 0)
+		g.set = badger.EntriesSet(g.set, key, v)
 	case *types.Tuple:
 		var args [][]byte
 		args = append(args, []byte{kindTuple})
@@ -356,7 +360,7 @@ func (g *Graph) encodeType(T types.Type) {
 			args = append(args, g.objToID[v])
 		}
 		v := encodeBytes(args...)
-		g.kv.Set(key, v, 0)
+		g.set = badger.EntriesSet(g.set, key, v)
 	case *types.Map:
 		g.encodeType(T.Key())
 		g.encodeType(T.Elem())
@@ -365,7 +369,7 @@ func (g *Graph) encodeType(T types.Type) {
 			g.typToID.At(T.Key()).([]byte),
 			g.typToID.At(T.Elem()).([]byte),
 		)
-		g.kv.Set(key, v, 0)
+		g.set = badger.EntriesSet(g.set, key, v)
 	case *types.Chan:
 		g.encodeType(T.Elem())
 
@@ -374,8 +378,7 @@ func (g *Graph) encodeType(T types.Type) {
 			g.typToID.At(T.Elem()).([]byte),
 			[]byte{byte(T.Dir())},
 		)
-
-		g.kv.Set(key, v, 0)
+		g.set = badger.EntriesSet(g.set, key, v)
 	default:
 		panic(fmt.Sprintf("%T", T))
 	}
