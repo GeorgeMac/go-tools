@@ -201,11 +201,10 @@ func (g *Graph) decodeType(id []byte) types.Type {
 		g.idToTyp[string(id)] = T
 
 		prefix := []byte(fmt.Sprintf("%s/item/", id))
-		// OPT(dh): we don't need a second iterator, the first
+		// OPT(dh): we don't need to ierate a second time, the first
 		// iterator collects all the keys already
-		it := g.kv.NewIterator(badger.DefaultIteratorOptions)
-		defer it.Close()
 		var vars []*types.Var
+		it.Rewind()
 		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 			vars = append(vars, g.decodeObject(it.Item().Value()).(*types.Var))
 		}
@@ -221,11 +220,9 @@ func (g *Graph) decodeType(id []byte) types.Type {
 		obj := g.decodeObject([]byte(m["obj"])).(*types.TypeName)
 		underlying := g.decodeType([]byte(m["underlying"]))
 		prefix := []byte(fmt.Sprintf("%s/method/", id))
-		// OPT(dh): we don't need a second iterator, the first
-		// iterator collects all the keys already
-		it := g.kv.NewIterator(badger.DefaultIteratorOptions)
-		defer it.Close()
+		// OPT(dh): we don't need to iterate a second time, the first
 		var fns []*types.Func
+		it.Rewind()
 		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 			fns = append(fns, g.decodeObject(it.Item().Value()).(*types.Func))
 		}
@@ -239,18 +236,17 @@ func (g *Graph) decodeType(id []byte) types.Type {
 		var tags []string
 
 		prefix := []byte(fmt.Sprintf("%s/field/", id))
-		// OPT(dh): we don't need a second iterator, the first
+		// OPT(dh): we don't need to iterate a second time, the first
 		// iterator collects all the keys already
-		it := g.kv.NewIterator(badger.DefaultIteratorOptions)
-		defer it.Close()
+		it.Rewind()
 		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 			fields = append(fields, g.decodeObject(it.Item().Value()).(*types.Var))
 		}
 
 		prefix = []byte(fmt.Sprintf("%s/tag/", id))
-		// OPT(dh): we don't need a second iterator, the first
+		// OPT(dh): we don't need to iterate a second time, the first
 		// iterator collects all the keys already
-		it = g.kv.NewIterator(badger.DefaultIteratorOptions)
+		it.Rewind()
 		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 			tags = append(tags, string(it.Item().Value()))
 		}
@@ -265,18 +261,17 @@ func (g *Graph) decodeType(id []byte) types.Type {
 		var embeddeds []*types.Named
 
 		prefix := []byte(fmt.Sprintf("%s/method/", id))
-		// OPT(dh): we don't need a second iterator, the first
+		// OPT(dh): we don't need iterate a second time, the first
 		// iterator collects all the keys already
-		it := g.kv.NewIterator(badger.DefaultIteratorOptions)
+		it.Rewind()
 		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 			fns = append(fns, g.decodeObject(it.Item().Value()).(*types.Func))
 		}
 
 		prefix = []byte(fmt.Sprintf("%s/embedded/", id))
-		// OPT(dh): we don't need a second iterator, the first
+		// OPT(dh): we don't need to iterate a second time, the first
 		// iterator collects all the keys already
-		it = g.kv.NewIterator(badger.DefaultIteratorOptions)
-		defer it.Close()
+		it.Rewind()
 		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
 			embeddeds = append(embeddeds, g.decodeType(it.Item().Value()).(*types.Named))
 		}
