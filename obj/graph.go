@@ -104,8 +104,9 @@ func (g *Graph) encodeScope(pkg *types.Package, scope *types.Scope) [16]byte {
 	var args [][]byte
 
 	names := scope.Names()
-	n := make([]byte, 8)
-	binary.LittleEndian.PutUint64(n, uint64(len(names)))
+	n := make([]byte, binary.MaxVarintLen64)
+	l := binary.PutUvarint(n, uint64(len(names)))
+	n = n[:l]
 	args = append(args, n)
 
 	for _, name := range names {
@@ -114,8 +115,9 @@ func (g *Graph) encodeScope(pkg *types.Package, scope *types.Scope) [16]byte {
 		args = append(args, g.objToID[obj])
 	}
 
-	n = make([]byte, 8)
-	binary.LittleEndian.PutUint64(n, uint64(scope.NumChildren()))
+	n = make([]byte, binary.MaxVarintLen64)
+	l = binary.PutUvarint(n, uint64(scope.NumChildren()))
+	n = n[:l]
 	args = append(args, n)
 
 	for i := 0; i < scope.NumChildren(); i++ {
@@ -211,10 +213,10 @@ func (g *Graph) encodeObject(obj types.Object) {
 
 func encodeBytes(vs ...[]byte) []byte {
 	var out []byte
-	num := make([]byte, 4)
+	num := make([]byte, binary.MaxVarintLen64)
 	for _, v := range vs {
-		binary.LittleEndian.PutUint32(num, uint32(len(v)))
-		out = append(out, num...)
+		n := binary.PutUvarint(num, uint64(len(v)))
+		out = append(out, num[:n]...)
 		out = append(out, v...)
 	}
 	return out
@@ -298,9 +300,9 @@ func (g *Graph) encodeType(T types.Type) {
 		var args [][]byte
 		args = append(args, []byte{kindInterface})
 
-		n := make([]byte, 8)
-		binary.LittleEndian.PutUint64(n, uint64(T.NumExplicitMethods()))
-		args = append(args, n)
+		n := make([]byte, binary.MaxVarintLen64)
+		l := binary.PutUvarint(n, uint64(T.NumExplicitMethods()))
+		args = append(args, n[:l])
 
 		for i := 0; i < T.NumExplicitMethods(); i++ {
 			fn := T.ExplicitMethod(i)
@@ -308,9 +310,9 @@ func (g *Graph) encodeType(T types.Type) {
 			args = append(args, g.objToID[fn])
 		}
 
-		n = make([]byte, 8)
-		binary.LittleEndian.PutUint64(n, uint64(T.NumEmbeddeds()))
-		args = append(args, n)
+		n = make([]byte, binary.MaxVarintLen64)
+		l = binary.PutUvarint(n, uint64(T.NumEmbeddeds()))
+		args = append(args, n[:l])
 
 		for i := 0; i < T.NumEmbeddeds(); i++ {
 			embedded := T.Embedded(i)
@@ -323,8 +325,9 @@ func (g *Graph) encodeType(T types.Type) {
 		elem := T.Elem()
 		g.encodeType(elem)
 
-		n := make([]byte, 8)
-		binary.LittleEndian.PutUint64(n, uint64(T.Len()))
+		n := make([]byte, binary.MaxVarintLen64)
+		l := binary.PutUvarint(n, uint64(T.Len()))
+		n = n[:l]
 		v := encodeBytes(
 			[]byte{kindArray},
 			g.typToID.At(elem).([]byte),

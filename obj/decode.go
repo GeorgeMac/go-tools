@@ -71,14 +71,14 @@ func (g *Graph) getPackage(id []byte) *types.Package {
 
 func (g *Graph) decodeScope(scopes map[string][]byte, scope *types.Scope, id []byte) {
 	vals := decodeBytes(scopes[string(id)])
-	n := binary.LittleEndian.Uint64(vals[0])
+	n, _ := binary.Uvarint(vals[0])
 	for i := uint64(0); i < n; i++ {
 		obj := g.decodeObject(vals[i+1])
 		scope.Insert(obj)
 	}
 
 	vals = vals[n+1:]
-	n = binary.LittleEndian.Uint64(vals[0])
+	n, _ = binary.Uvarint(vals[0])
 	for i := uint64(0); i < n; i++ {
 		child := types.NewScope(scope, 0, 0, "")
 		g.decodeScope(scopes, child, vals[i+1])
@@ -175,9 +175,10 @@ func decodeBytes(b []byte) [][]byte {
 		if len(b) == 0 {
 			break
 		}
-		n := binary.LittleEndian.Uint32(b)
-		out = append(out, b[4:4+n])
-		b = b[4+n:]
+		n, l := binary.Uvarint(b)
+		b = b[l:]
+		out = append(out, b[:n])
+		b = b[n:]
 	}
 	return out
 }
@@ -272,14 +273,14 @@ func (g *Graph) decodeType(id []byte) types.Type {
 		var fns []*types.Func
 		var embeddeds []*types.Named
 
-		n := binary.LittleEndian.Uint64(vals[1])
+		n, _ := binary.Uvarint(vals[1])
 		vals = vals[2:]
 		for i := uint64(0); i < n; i++ {
 			fns = append(fns, g.decodeObject(vals[i]).(*types.Func))
 		}
 
 		vals = vals[n:]
-		n = binary.LittleEndian.Uint64(vals[0])
+		n, _ = binary.Uvarint(vals[0])
 		vals = vals[1:]
 		for i := uint64(0); i < n; i++ {
 			embeddeds = append(embeddeds, g.decodeType(vals[i]).(*types.Named))
@@ -327,7 +328,7 @@ func (g *Graph) decodeType(id []byte) types.Type {
 		g.idToTyp[string(id)] = T
 
 		elem := g.decodeType(vals[1])
-		n := binary.LittleEndian.Uint64(vals[2])
+		n, _ := binary.Uvarint(vals[2])
 		*T = *types.NewArray(elem, int64(n))
 
 		return T
