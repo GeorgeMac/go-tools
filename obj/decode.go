@@ -58,18 +58,20 @@ func (g *Graph) getPackage(id []byte) *types.Package {
 }
 
 func (g *Graph) decodeScope(scope *types.Scope, id []byte) {
-	prefix := []byte(fmt.Sprintf("%s/objects/", id))
-	it := g.kv.NewIterator(badger.DefaultIteratorOptions)
-	defer it.Close()
-	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
-		obj := g.decodeObject(it.Item().Value())
+	var item badger.KVItem
+	g.kv.Get(id, &item)
+	vals := decodeBytes(item.Value())
+	n := binary.LittleEndian.Uint64(vals[0])
+	for i := uint64(0); i < n; i++ {
+		obj := g.decodeObject(vals[i+1])
 		scope.Insert(obj)
 	}
 
-	prefix = []byte(fmt.Sprintf("%s/children/", id))
-	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+	vals = vals[n+1:]
+	n = binary.LittleEndian.Uint64(vals[0])
+	for i := uint64(0); i < n; i++ {
 		child := types.NewScope(scope, 0, 0, "")
-		g.decodeScope(child, it.Item().Value())
+		g.decodeScope(child, vals[i+1])
 	}
 }
 

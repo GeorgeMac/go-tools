@@ -104,13 +104,22 @@ func (g *Graph) InsertPackage(pkg *types.Package) {
 func (g *Graph) encodeScope(scope *types.Scope) uuid.UUID {
 	id := uuid.NewV1()
 
-	for i, name := range scope.Names() {
-		// OPT(dh): store index as raw bytes
-		key := []byte(fmt.Sprintf("scopes/%s/objects/%d", id, i))
+	var args [][]byte
+
+	names := scope.Names()
+	n := make([]byte, 8)
+	binary.LittleEndian.PutUint64(n, uint64(len(names)))
+	args = append(args, n)
+
+	for _, name := range names {
 		obj := scope.Lookup(name)
 		g.encodeObject(obj)
-		g.kv.Set(key, g.objToID[obj], 0)
+		args = append(args, g.objToID[obj])
 	}
+
+	n = make([]byte, 8)
+	binary.LittleEndian.PutUint64(n, uint64(scope.NumChildren()))
+	args = append(args, n)
 
 	for i := 0; i < scope.NumChildren(); i++ {
 		// OPT(dh): children scopes are only ever referenced by their
@@ -121,11 +130,13 @@ func (g *Graph) encodeScope(scope *types.Scope) uuid.UUID {
 		// can sort them with packages and read and delete them all in
 		// one go, without following references.
 
-		// OPT(dh): index as bytes
-		key := []byte(fmt.Sprintf("scopes/%s/children/%d", id, i))
 		sid := g.encodeScope(scope.Child(i))
-		g.kv.Set(key, []byte(fmt.Sprintf("scopes/%s", sid)), 0)
+		args = append(args, []byte(fmt.Sprintf("scopes/%s", sid)))
 	}
+
+	v := encodeBytes(args...)
+	key := []byte(fmt.Sprintf("scopes/%s", id))
+	g.kv.Set(key, v, 0)
 
 	return id
 }
