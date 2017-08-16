@@ -8,6 +8,8 @@ import (
 	"reflect"
 	"strconv"
 
+	"honnef.co/go/tools/typeutil"
+
 	"github.com/dgraph-io/badger"
 	uuid "github.com/satori/go.uuid"
 )
@@ -43,8 +45,7 @@ type Graph struct {
 	kv *badger.KV
 
 	objToID map[types.Object][]byte
-	// OPT(dh): use typeutil.Map so we canonicalize identical types
-	typToID map[types.Type][]byte
+	typToID typeutil.Map
 
 	idToObj map[string]types.Object
 	idToTyp map[string]types.Type
@@ -65,7 +66,6 @@ func OpenGraph(dir string) (*Graph, error) {
 	return &Graph{
 		kv:      kv,
 		objToID: map[types.Object][]byte{},
-		typToID: map[types.Type][]byte{},
 		idToObj: map[string]types.Object{},
 		idToTyp: map[string]types.Type{},
 		idToPkg: map[string]*types.Package{},
@@ -150,7 +150,7 @@ func (g *Graph) encodeObject(obj types.Object) {
 	g.objToID[obj] = key
 
 	g.encodeType(obj.Type())
-	typID := g.typToID[obj.Type()]
+	typID := g.typToID.At(obj.Type())
 	typ := ""
 	switch obj.(type) {
 	case *types.Func:
@@ -186,18 +186,18 @@ func (g *Graph) encodeObject(obj types.Object) {
 }
 
 func (g *Graph) encodeType(T types.Type) {
-	if _, ok := g.typToID[T]; ok {
+	if id := g.typToID.At(T); id != nil {
 		return
 	}
 	if T, ok := T.(*types.Basic); ok {
 		// OPT(dh): use an enum instead of strings for the built in
 		// types
-		g.typToID[T] = []byte(fmt.Sprintf("builtin/%s", T.Name()))
+		g.typToID.Set(T, []byte(fmt.Sprintf("builtin/%s", T.Name())))
 		return
 	}
 	id := uuid.NewV1()
 	key := []byte(fmt.Sprintf("types/%s", id))
-	g.typToID[T] = key
+	g.typToID.Set(T, key)
 
 	typ := ""
 	switch T := T.(type) {
@@ -211,9 +211,9 @@ func (g *Graph) encodeType(T types.Type) {
 		}
 
 		key = []byte(fmt.Sprintf("types/%s/params", id))
-		g.kv.Set(key, g.typToID[T.Params()], 0)
+		g.kv.Set(key, g.typToID.At(T.Params()).([]byte), 0)
 		key = []byte(fmt.Sprintf("types/%s/results", id))
-		g.kv.Set(key, g.typToID[T.Results()], 0)
+		g.kv.Set(key, g.typToID.At(T.Results()).([]byte), 0)
 		if T.Recv() != nil {
 			key = []byte(fmt.Sprintf("types/%s/recv", id))
 			g.kv.Set(key, g.objToID[T.Recv()], 0)
@@ -231,7 +231,7 @@ func (g *Graph) encodeType(T types.Type) {
 		underlying := T.Underlying()
 		g.encodeType(underlying)
 		key = []byte(fmt.Sprintf("types/%s/underlying", id))
-		g.kv.Set(key, g.typToID[underlying], 0)
+		g.kv.Set(key, g.typToID.At(underlying).([]byte), 0)
 
 		typename := T.Obj()
 		g.encodeObject(typename)
@@ -250,13 +250,13 @@ func (g *Graph) encodeType(T types.Type) {
 		elem := T.Elem()
 		g.encodeType(elem)
 		key = []byte(fmt.Sprintf("types/%s/elem", id))
-		g.kv.Set(key, g.typToID[elem], 0)
+		g.kv.Set(key, g.typToID.At(elem).([]byte), 0)
 	case *types.Pointer:
 		typ = "pointer"
 		elem := T.Elem()
 		g.encodeType(elem)
 		key = []byte(fmt.Sprintf("types/%s/elem", id))
-		g.kv.Set(key, g.typToID[elem], 0)
+		g.kv.Set(key, g.typToID.At(elem).([]byte), 0)
 	case *types.Interface:
 		typ = "interface"
 
@@ -273,7 +273,7 @@ func (g *Graph) encodeType(T types.Type) {
 			g.encodeType(embedded)
 			// OPT(dh): store index as bytes
 			key = []byte(fmt.Sprintf("types/%s/embedded/%d", id, i))
-			g.kv.Set(key, g.typToID[embedded], 0)
+			g.kv.Set(key, g.typToID.At(embedded).([]byte), 0)
 		}
 	case *types.Array:
 		typ = "array"
@@ -281,7 +281,7 @@ func (g *Graph) encodeType(T types.Type) {
 		elem := T.Elem()
 		g.encodeType(elem)
 		key = []byte(fmt.Sprintf("types/%s/elem", id))
-		g.kv.Set(key, g.typToID[elem], 0)
+		g.kv.Set(key, g.typToID.At(elem).([]byte), 0)
 
 		n := T.Len()
 		key = []byte(fmt.Sprintf("types/%s/len", id))
@@ -321,16 +321,16 @@ func (g *Graph) encodeType(T types.Type) {
 		g.encodeType(T.Key())
 		g.encodeType(T.Elem())
 		key := []byte(fmt.Sprintf("types/%s/key", id))
-		g.kv.Set(key, g.typToID[T.Key()], 0)
+		g.kv.Set(key, g.typToID.At(T.Key()).([]byte), 0)
 		key = []byte(fmt.Sprintf("types/%s/elem", id))
-		g.kv.Set(key, g.typToID[T.Elem()], 0)
+		g.kv.Set(key, g.typToID.At(T.Elem()).([]byte), 0)
 
 	case *types.Chan:
 		typ = "chan"
 
 		g.encodeType(T.Elem())
 		key = []byte(fmt.Sprintf("types/%s/elem", id))
-		g.kv.Set(key, g.typToID[T.Elem()], 0)
+		g.kv.Set(key, g.typToID.At(T.Elem()).([]byte), 0)
 
 		key = []byte(fmt.Sprintf("types/%s/dir", id))
 		g.kv.Set(key, []byte{byte(T.Dir())}, 0)
