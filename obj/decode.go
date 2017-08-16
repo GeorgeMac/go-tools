@@ -45,7 +45,19 @@ func (g *Graph) Package(path string) *types.Package {
 	var item badger.KVItem
 	g.kv.Get(key, &item)
 
-	g.decodeScope(pkg.Scope(), item.Value())
+	g.scopes[pkg] = map[string][]byte{}
+
+	prefix := []byte(fmt.Sprintf("pkgs/%s\x00scopes/", pkg.Path()))
+	it.Rewind()
+	for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+		cp := make([]byte, len(it.Item().Value()))
+		copy(cp, it.Item().Value())
+
+		g.scopes[pkg][string(it.Item().Key())] = cp
+	}
+	g.decodeScope(g.scopes[pkg], pkg.Scope(), item.Value())
+
+	// TODO(dh): clear g.scopes[pkg]
 
 	pkg.SetImports(imps)
 	pkg.MarkComplete()
@@ -57,10 +69,8 @@ func (g *Graph) getPackage(id []byte) *types.Package {
 	return g.idToPkg[string(id)]
 }
 
-func (g *Graph) decodeScope(scope *types.Scope, id []byte) {
-	var item badger.KVItem
-	g.kv.Get(id, &item)
-	vals := decodeBytes(item.Value())
+func (g *Graph) decodeScope(scopes map[string][]byte, scope *types.Scope, id []byte) {
+	vals := decodeBytes(scopes[string(id)])
 	n := binary.LittleEndian.Uint64(vals[0])
 	for i := uint64(0); i < n; i++ {
 		obj := g.decodeObject(vals[i+1])
@@ -71,7 +81,7 @@ func (g *Graph) decodeScope(scope *types.Scope, id []byte) {
 	n = binary.LittleEndian.Uint64(vals[0])
 	for i := uint64(0); i < n; i++ {
 		child := types.NewScope(scope, 0, 0, "")
-		g.decodeScope(child, vals[i+1])
+		g.decodeScope(scopes, child, vals[i+1])
 	}
 }
 

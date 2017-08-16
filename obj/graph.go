@@ -46,6 +46,8 @@ type Graph struct {
 	idToPkg map[string]*types.Package
 
 	pkgs map[string]*types.Package
+
+	scopes map[*types.Package]map[string][]byte
 }
 
 func OpenGraph(dir string) (*Graph, error) {
@@ -64,6 +66,7 @@ func OpenGraph(dir string) (*Graph, error) {
 		idToTyp: map[string]types.Type{},
 		idToPkg: map[string]*types.Package{},
 		pkgs:    map[string]*types.Package{},
+		scopes:  map[*types.Package]map[string][]byte{},
 	}, nil
 }
 
@@ -96,12 +99,12 @@ func (g *Graph) InsertPackage(pkg *types.Package) {
 	key := []byte(fmt.Sprintf("pkgs/%s\x00name", pkg.Path()))
 	g.kv.Set(key, []byte(pkg.Name()), 0)
 
-	id := []byte(fmt.Sprintf("scopes/%s", g.encodeScope(pkg.Scope())))
+	id := []byte(fmt.Sprintf("pkgs/%s\x00scopes/%s", pkg.Path(), g.encodeScope(pkg, pkg.Scope())))
 	key = []byte(fmt.Sprintf("pkgs/%s\x00scope", pkg.Path()))
 	g.kv.Set(key, id, 0)
 }
 
-func (g *Graph) encodeScope(scope *types.Scope) uuid.UUID {
+func (g *Graph) encodeScope(pkg *types.Package, scope *types.Scope) uuid.UUID {
 	id := uuid.NewV1()
 
 	var args [][]byte
@@ -122,20 +125,12 @@ func (g *Graph) encodeScope(scope *types.Scope) uuid.UUID {
 	args = append(args, n)
 
 	for i := 0; i < scope.NumChildren(); i++ {
-		// OPT(dh): children scopes are only ever referenced by their
-		// parent scopes. it would make sense to store them
-		// sequentially, in a way that only requires one iterator seek
-		// to load an entire scope tree in one go, instead of chasing
-		// references. additionally, scopes belong to packages, so we
-		// can sort them with packages and read and delete them all in
-		// one go, without following references.
-
-		sid := g.encodeScope(scope.Child(i))
-		args = append(args, []byte(fmt.Sprintf("scopes/%s", sid)))
+		sid := g.encodeScope(pkg, scope.Child(i))
+		args = append(args, []byte(fmt.Sprintf("pkgs/%s\x00scopes/%s", pkg.Path(), sid)))
 	}
 
 	v := encodeBytes(args...)
-	key := []byte(fmt.Sprintf("scopes/%s", id))
+	key := []byte(fmt.Sprintf("pkgs/%s\x00scopes/%s", pkg.Path(), id))
 	g.kv.Set(key, v, 0)
 
 	return id
