@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"go/types"
+	"log"
 
 	"github.com/dgraph-io/badger"
 )
@@ -16,6 +17,8 @@ func (g *Graph) Package(path string) *types.Package {
 	if pkg, ok := g.pkgs[path]; ok {
 		return pkg
 	}
+
+	g.curpkg = path
 
 	opt := badger.DefaultIteratorOptions
 	it := g.kv.NewIterator(opt)
@@ -94,7 +97,13 @@ func (g *Graph) decodeObject(id []byte) types.Object {
 	}
 	var item badger.KVItem
 	g.kv.Get(id, &item)
-	obj := g.decodeObjectItem(&item, nil)
+	parts := bytes.SplitN(id, []byte{0}, 2)
+	pkg := g.idToPkg[string(parts[0])]
+	if pkg == nil {
+		log.Printf("don't know package %s for object %q, used by package %s", parts[0], id, g.curpkg)
+		panic("")
+	}
+	obj := g.decodeObjectItem(&item, pkg)
 	g.idToObj[string(id)] = obj
 	return obj
 }

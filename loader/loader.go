@@ -1,19 +1,13 @@
 package loader
 
 import (
-	"errors"
-	"fmt"
 	"go/ast"
 	"go/build"
-	"go/parser"
 	"go/token"
 	"go/types"
-	"log"
-	"strings"
 
+	"honnef.co/go/tools/obj"
 	"honnef.co/go/tools/ssa"
-
-	"golang.org/x/tools/go/buildutil"
 )
 
 // FIXME(dh): when we reparse a package, new files get added to the
@@ -26,44 +20,38 @@ import (
 type Package struct {
 	*types.Package
 	*types.Info
-
-	Files map[*token.File]*ast.File
+	Build *build.Package
 	SSA   *ssa.Package
 
-	Dependencies        map[string]struct{}
-	ReverseDependencies map[string]struct{}
+	dependencies        map[*Package]struct{}
+	reverseDependencies map[*Package]struct{}
 
+	Program  *Program
+	Files    map[*token.File]*ast.File
 	Explicit bool
-
-	Program *Program
-
-	State int
-
-	Errors []error
+	State    int
+	Errors   []error
 }
 
 const (
-	Dirty = 1 << iota
-	InvalidAST
+	InvalidAST = 1 << iota
 	TypeError
 	NoSSA
 )
 
-func (p *Package) MarkDirty()    { p.Program.markDirty(p) }
-func (p *Package) IsDirty() bool { return (p.State & Dirty) != 0 }
-
-func (a *Program) markDirty(pkg *Package) {
-	pkg.State |= Dirty
+func (a *Program) Remove(pkg *Package) {
 	if pkg.SSA != nil {
 		a.SSA.RemovePackage(pkg.SSA)
 	}
-	for rdep := range pkg.ReverseDependencies {
-		// the package might not be cached yet if we're currently
-		// importing its dependencies
-		if rpkg := a.Package(rdep); rpkg != nil {
-			a.markDirty(rpkg)
-		}
+	for rdep := range pkg.reverseDependencies {
+		a.Remove(rdep)
 	}
+	for dep := range pkg.dependencies {
+		delete(dep.reverseDependencies, pkg)
+	}
+	delete(a.Packages, pkg.Path())
+	delete(a.TypePackages, pkg.Package)
+	// XXX remove old packages from graph
 }
 
 func (a *Program) newPackage() *Package {
@@ -77,8 +65,8 @@ func (a *Program) newPackage() *Package {
 			Scopes:     map[ast.Node]*types.Scope{},
 			InitOrder:  []*types.Initializer{},
 		},
-		Dependencies:        map[string]struct{}{},
-		ReverseDependencies: map[string]struct{}{},
+		dependencies:        map[*Package]struct{}{},
+		reverseDependencies: map[*Package]struct{}{},
 		Program:             a,
 	}
 }
@@ -95,9 +83,11 @@ type Program struct {
 	Errors  []error
 
 	logDepth int
+
+	g *obj.Graph
 }
 
-func NewProgram() *Program {
+func NewProgram(g *obj.Graph) *Program {
 	fset := token.NewFileSet()
 	a := &Program{
 		Fset:         fset,
@@ -106,6 +96,7 @@ func NewProgram() *Program {
 		SSA:          ssa.NewProgram(fset, ssa.GlobalDebug),
 		checker:      &types.Config{},
 		Build:        build.Default,
+		g:            g,
 	}
 	a.checker.Importer = a
 	a.checker.Error = func(err error) {
@@ -135,18 +126,15 @@ func (a *Program) ImportFrom(path, srcDir string, mode types.ImportMode) (*types
 		return nil, err
 	}
 
-	if pkg, ok := a.Packages[bpkg.ImportPath]; ok && !pkg.IsDirty() {
+	if pkg, ok := a.Packages[bpkg.ImportPath]; ok {
 		return pkg.Package, nil
 	}
 	// FIXME(dh): don't recurse forever on circular dependencies
 	pkg, err := a.compile(path, srcDir)
-	a.Packages[bpkg.ImportPath] = pkg
-	a.TypePackages[pkg.Package] = pkg
 	return pkg.Package, err
 }
 
-// Package returns a cached package. The result may be nil or the
-// resulting package may be marked as dirty.
+// Package returns a cached package. The result may be nil.
 func (a *Program) Package(path string) *Package {
 	return a.Packages[path]
 }
@@ -155,7 +143,7 @@ func (a *Program) Package(path string) *Package {
 // cache if appropriate, or compile the package.
 func (a *Program) CompiledPackage(path string) (*Package, error) {
 	pkg, ok := a.Packages[path]
-	if ok && !pkg.IsDirty() {
+	if ok {
 		return pkg, nil
 	}
 	return a.Compile(path)
@@ -174,22 +162,40 @@ func (a *Program) Compile(path string) (*Package, error) {
 
 	pkg, err := a.compile(path, ".")
 	pkg.Explicit = true
-	a.Packages[path] = pkg
-	a.TypePackages[pkg.Package] = pkg
 	return pkg, err
 }
 
-func (a *Program) RecompileDirtyPackages() error {
-	for path, pkg := range a.Packages {
-		if !pkg.IsDirty() {
-			continue
-		}
-		_, err := a.compile(path, ".")
-		if err != nil {
-			return err
-		}
+// XXX update reverse dependencies when package gets removed
+
+func (a *Program) register(pkg *Package) {
+	if a.Packages[pkg.Path()] == pkg {
+		// Already registered the package
+		return
 	}
-	return nil
+	a.Packages[pkg.Path()] = pkg
+	a.TypePackages[pkg.Package] = pkg
+
+	for _, imp := range pkg.Imports() {
+		// Importing packages from the index can load multiple new
+		// packages into memory, not just the one explicitly compiled.
+		// We have to make sure that these dependencies are tracked
+		// correctly.
+		//
+		// It is not possible that we're holding a reference to an old
+		// version of a dependency. New versions can only appear after
+		// the old version has been explicitly removed, which untracks
+		// it.
+		aimp, ok := a.TypePackages[imp]
+		if !ok {
+			// We don't yet know about the package
+			aimp = a.newPackage()
+			aimp.Package = imp
+			// TODO(dh): set files and build SSA form
+			a.register(aimp)
+		}
+		pkg.dependencies[aimp] = struct{}{}
+		aimp.reverseDependencies[pkg] = struct{}{}
+	}
 }
 
 func (a *Program) compile(path string, srcdir string) (*Package, error) {
@@ -198,52 +204,66 @@ func (a *Program) compile(path string, srcdir string) (*Package, error) {
 	pkg := a.newPackage()
 	old, ok := a.Packages[path]
 	if ok {
-		pkg.ReverseDependencies = old.ReverseDependencies
 		pkg.Explicit = old.Explicit
-	}
-	delete(a.TypePackages, pkg.Package)
-
-	log.Printf("%scompiling %s", strings.Repeat("\t", a.logDepth), path)
-	// OPT(dh): when compile gets called while rebuilding dirty
-	// packages, it is unnecessary to call markDirty. in fact, this
-	// causes exponential complexity.
-	if path == "unsafe" {
-		pkg.Package = types.Unsafe
-		pkg.State &^= Dirty
-		return pkg, nil
+		a.Remove(old)
 	}
 
-	a.markDirty(pkg)
+	// if path == "unsafe" {
+	// 	pkg.Package = types.Unsafe
+	// 	return pkg, nil
+	// }
 
-	build, err := a.Build.Import(path, srcdir, 0)
-	if err != nil {
-		return nil, err
-	}
-	if len(build.CgoFiles) != 0 {
-		return nil, errors.New("cgo is not currently supported")
-	}
+	// log.Printf("%scompiling %s", strings.Repeat("\t", a.logDepth), path)
+	// build, err := a.Build.Import(path, srcdir, 0)
+	// if err != nil {
+	// 	return pkg, err
+	// }
 
-	pkg.Files = map[*token.File]*ast.File{}
+	pkg.Build = build
 	var files []*ast.File
-	for _, f := range build.GoFiles {
-		// TODO(dh): cache parsed files and only reparse them if
-		// necessary
-		af, err := buildutil.ParseFile(a.Fset, &a.Build, nil, build.Dir, f, parser.ParseComments)
-		if err != nil {
-			pkg.Errors = append(pkg.Errors, err)
-			pkg.State |= InvalidAST
-		}
-		tf := a.Fset.File(af.Pos())
-		pkg.Files[tf] = af
-		files = append(files, af)
-	}
+	// if a.g.HasPackage(build.ImportPath) {
+	// 	log.Println("using graph for", build.ImportPath)
+	// 	// XXX validate checksum
+	// 	// XXX load AST from somewhere
+	// 	// XXX load packageinfo from somewhere
+	// 	pkg.Package = a.g.Package(build.ImportPath)
+	// 	a.register(pkg)
+	// 	return pkg, nil
+	// }
+
+	// pkg.Files = map[*token.File]*ast.File{}
+	// for _, f := range build.GoFiles {
+	// 	// TODO(dh): cache parsed files and only reparse them if
+	// 	// necessary
+	// 	af, err := buildutil.ParseFile(a.Fset, &a.Build, nil, build.Dir, f, parser.ParseComments)
+	// 	if err != nil {
+	// 		pkg.Errors = append(pkg.Errors, err)
+	// 		pkg.State |= InvalidAST
+	// 	}
+	// 	tf := a.Fset.File(af.Pos())
+	// 	pkg.Files[tf] = af
+	// 	files = append(files, af)
+	// }
+
+	// if len(build.CgoFiles) > 0 {
+	// 	cgoFiles, err := cgo.ProcessCgoFiles(build, a.Fset, nil, parser.ParseComments)
+	// 	if err != nil {
+	// 		pkg.Errors = append(pkg.Errors, err)
+	// 		pkg.State |= InvalidAST
+	// 	}
+	// 	files = append(files, cgoFiles...)
+	// 	for _, af := range cgoFiles {
+	// 		tf := a.Fset.File(af.Pos())
+	// 		pkg.Files[tf] = af
+	// 	}
+	// }
 
 	pkg.Package, err = a.checker.Check(path, a.Fset, files, pkg.Info)
 	if err != nil {
 		pkg.State |= TypeError
 	}
 
-	if pkg.State == Dirty {
+	if pkg.State == 0 && files != nil {
 		incomplete := false
 		for _, dep := range pkg.Imports() {
 			if a.TypePackages[dep].State != 0 {
@@ -252,6 +272,7 @@ func (a *Program) compile(path string, srcdir string) (*Package, error) {
 			}
 		}
 		if !incomplete {
+			a.g.InsertPackage(pkg.Build, pkg.Package)
 			pkg.SSA = a.SSA.CreatePackage(pkg.Package, files, pkg.Info, true)
 			pkg.SSA.Build()
 		}
@@ -259,24 +280,9 @@ func (a *Program) compile(path string, srcdir string) (*Package, error) {
 		pkg.State |= NoSSA
 	}
 
-	for _, imp := range build.Imports {
-		// OPT(dh): we're duplicating a lot of go/build lookups
-		// between here and ImportFrom. Maybe we can cache them.
-		bdep, err := a.Build.Import(imp, build.Dir, 0)
-		if err != nil {
-			// shouldn't happen
-			return nil, err
-		}
-		dep := a.Package(bdep.ImportPath)
-		if dep == nil {
-			panic(fmt.Sprintf("internal inconsistency: depdency %q of %q is missing", imp, build.ImportPath))
-		}
-		pkg.Dependencies[bdep.ImportPath] = struct{}{}
-		dep.ReverseDependencies[build.ImportPath] = struct{}{}
-	}
-
-	pkg.State &^= Dirty
 	pkg.Errors = append(pkg.Errors, a.Errors...)
 	a.Errors = nil
+	a.g.InsertPackage(pkg.Package)
+	a.register(pkg)
 	return pkg, nil
 }

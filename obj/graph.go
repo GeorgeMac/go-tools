@@ -3,8 +3,16 @@ package obj
 import (
 	"encoding/binary"
 	"fmt"
+	"go/ast"
+	"go/build"
+	"go/parser"
+	"go/token"
 	"go/types"
+	"log"
 	"reflect"
+
+	"golang.org/x/tools/go/buildutil"
+	"honnef.co/go/tools/obj/cgo"
 
 	"github.com/dgraph-io/badger"
 	uuid "github.com/satori/go.uuid"
@@ -28,6 +36,10 @@ import (
 // TODO(dh): store AST, types.Info and checksums
 
 type Graph struct {
+	curpkg string
+
+	Fset *token.FileSet
+
 	kv *badger.KV
 
 	objToID map[types.Object][]byte
@@ -37,10 +49,15 @@ type Graph struct {
 	idToTyp map[string]types.Type
 	idToPkg map[string]*types.Package
 
+	// OPT(dh): merge idToPkg and pkgs
 	pkgs map[string]*types.Package
 
 	scopes map[*types.Package]map[string][]byte
 	set    []*badger.Entry
+
+	build build.Context
+
+	checker *types.Config
 }
 
 func OpenGraph(dir string) (*Graph, error) {
@@ -52,7 +69,8 @@ func OpenGraph(dir string) (*Graph, error) {
 		return nil, err
 	}
 
-	return &Graph{
+	g := &Graph{
+		Fset:    token.NewFileSet(),
 		kv:      kv,
 		objToID: map[types.Object][]byte{},
 		typToID: map[types.Type][]byte{},
@@ -61,7 +79,70 @@ func OpenGraph(dir string) (*Graph, error) {
 		idToPkg: map[string]*types.Package{},
 		pkgs:    map[string]*types.Package{},
 		scopes:  map[*types.Package]map[string][]byte{},
-	}, nil
+		build:   build.Default,
+		checker: &types.Config{},
+	}
+	g.checker.Importer = g
+
+	return g, nil
+}
+
+func (g *Graph) Import(path string) (*types.Package, error) {
+	panic("not implemented, use ImportFrom")
+}
+
+func (g *Graph) ImportFrom(path, srcDir string, mode types.ImportMode) (*types.Package, error) {
+	bpkg, err := g.build.Import(path, srcDir, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	if bpkg.ImportPath == "unsafe" {
+		return types.Unsafe, nil
+	}
+
+	// TODO(dh): use checksum to verify that package is up to date
+	if pkg, ok := g.pkgs[bpkg.ImportPath]; ok {
+		return pkg, nil
+	}
+	if g.HasPackage(bpkg.ImportPath) {
+		log.Println("importing from graph:", bpkg.ImportPath)
+		pkg := g.Package(bpkg.ImportPath)
+		return pkg, nil
+	}
+
+	log.Println("compiling:", bpkg.ImportPath)
+
+	// TODO(dh): support returning partially built packages. For
+	// example, an invalid AST still is usable for some operations.
+	var files []*ast.File
+	for _, f := range bpkg.GoFiles {
+		af, err := buildutil.ParseFile(g.Fset, &g.build, nil, bpkg.Dir, f, parser.ParseComments)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, af)
+	}
+
+	if len(bpkg.CgoFiles) > 0 {
+		cgoFiles, err := cgo.ProcessCgoFiles(bpkg, g.Fset, nil, parser.ParseComments)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, cgoFiles...)
+	}
+
+	// TODO(dh): collect info
+	info := &types.Info{}
+	pkg, err := g.checker.Check(path, g.Fset, files, info)
+	if err != nil {
+		return nil, err
+	}
+
+	// TODO(dh): build SSA
+
+	g.InsertPackage(bpkg, pkg)
+	return pkg, nil
 }
 
 func (g *Graph) HasPackage(path string) bool {
@@ -75,14 +156,15 @@ func (g *Graph) HasPackage(path string) bool {
 	return ok
 }
 
-func (g *Graph) InsertPackage(pkg *types.Package) {
+func (g *Graph) InsertPackage(bpkg *build.Package, pkg *types.Package) {
 	if pkg == types.Unsafe {
 		return
 	}
-	if _, ok := g.pkgs[pkg.Path()]; ok {
+	if _, ok := g.pkgs[bpkg.ImportPath]; ok {
 		return
 	}
-	g.pkgs[pkg.Path()] = pkg
+	log.Println("inserting", pkg)
+	g.pkgs[bpkg.ImportPath] = pkg
 
 	g.set = []*badger.Entry{}
 	for _, imp := range pkg.Imports() {
