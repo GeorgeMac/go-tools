@@ -6,8 +6,6 @@ import (
 	"go/types"
 	"reflect"
 
-	"honnef.co/go/tools/typeutil"
-
 	"github.com/dgraph-io/badger"
 	uuid "github.com/satori/go.uuid"
 )
@@ -33,7 +31,7 @@ type Graph struct {
 	kv *badger.KV
 
 	objToID map[types.Object][]byte
-	typToID typeutil.Map
+	typToID map[types.Type][]byte
 
 	idToObj map[string]types.Object
 	idToTyp map[string]types.Type
@@ -57,6 +55,7 @@ func OpenGraph(dir string) (*Graph, error) {
 	return &Graph{
 		kv:      kv,
 		objToID: map[types.Object][]byte{},
+		typToID: map[types.Type][]byte{},
 		idToObj: map[string]types.Object{},
 		idToTyp: map[string]types.Type{},
 		idToPkg: map[string]*types.Package{},
@@ -169,7 +168,7 @@ func (g *Graph) encodeObject(obj types.Object) {
 	g.objToID[obj] = key
 
 	g.encodeType(obj.Type())
-	typID := g.typToID.At(obj.Type()).([]byte)
+	typID := g.typToID[obj.Type()]
 	var typ byte
 	switch obj.(type) {
 	case *types.Func:
@@ -227,18 +226,18 @@ func encodeBytes(vs ...[]byte) []byte {
 }
 
 func (g *Graph) encodeType(T types.Type) {
-	if id := g.typToID.At(T); id != nil {
+	if id := g.typToID[T]; id != nil {
 		return
 	}
 	if T, ok := T.(*types.Basic); ok {
 		// OPT(dh): use an enum instead of strings for the built in
 		// types
-		g.typToID.Set(T, []byte(fmt.Sprintf("builtin/%s", T.Name())))
+		g.typToID[T] = []byte(fmt.Sprintf("builtin/%s", T.Name()))
 		return
 	}
 	id := uuid.NewV1()
 	key := []byte(fmt.Sprintf("types/%s", [16]byte(id)))
-	g.typToID.Set(T, key)
+	g.typToID[T] = key
 
 	switch T := T.(type) {
 	case *types.Signature:
@@ -252,8 +251,8 @@ func (g *Graph) encodeType(T types.Type) {
 		if T.Variadic() {
 			variadic = 1
 		}
-		params := g.typToID.At(T.Params()).([]byte)
-		results := g.typToID.At(T.Results()).([]byte)
+		params := g.typToID[T.Params()]
+		results := g.typToID[T.Results()]
 		recv := g.objToID[T.Recv()]
 
 		v := encodeBytes(
@@ -271,7 +270,7 @@ func (g *Graph) encodeType(T types.Type) {
 
 		underlying := T.Underlying()
 		g.encodeType(underlying)
-		args = append(args, g.typToID.At(underlying).([]byte))
+		args = append(args, g.typToID[underlying])
 
 		typename := T.Obj()
 		g.encodeObject(typename)
@@ -289,7 +288,7 @@ func (g *Graph) encodeType(T types.Type) {
 		g.encodeType(elem)
 		v := encodeBytes(
 			[]byte{kindSlice},
-			g.typToID.At(elem).([]byte),
+			g.typToID[elem],
 		)
 		g.set = badger.EntriesSet(g.set, key, v)
 	case *types.Pointer:
@@ -297,7 +296,7 @@ func (g *Graph) encodeType(T types.Type) {
 		g.encodeType(elem)
 		v := encodeBytes(
 			[]byte{kindPointer},
-			g.typToID.At(elem).([]byte),
+			g.typToID[elem],
 		)
 		g.set = badger.EntriesSet(g.set, key, v)
 	case *types.Interface:
@@ -321,7 +320,7 @@ func (g *Graph) encodeType(T types.Type) {
 		for i := 0; i < T.NumEmbeddeds(); i++ {
 			embedded := T.Embedded(i)
 			g.encodeType(embedded)
-			args = append(args, g.typToID.At(embedded).([]byte))
+			args = append(args, g.typToID[embedded])
 		}
 		v := encodeBytes(args...)
 		g.set = badger.EntriesSet(g.set, key, v)
@@ -334,7 +333,7 @@ func (g *Graph) encodeType(T types.Type) {
 		n = n[:l]
 		v := encodeBytes(
 			[]byte{kindArray},
-			g.typToID.At(elem).([]byte),
+			g.typToID[elem],
 			n,
 		)
 		g.set = badger.EntriesSet(g.set, key, v)
@@ -366,8 +365,8 @@ func (g *Graph) encodeType(T types.Type) {
 		g.encodeType(T.Elem())
 		v := encodeBytes(
 			[]byte{kindMap},
-			g.typToID.At(T.Key()).([]byte),
-			g.typToID.At(T.Elem()).([]byte),
+			g.typToID[T.Key()],
+			g.typToID[T.Elem()],
 		)
 		g.set = badger.EntriesSet(g.set, key, v)
 	case *types.Chan:
@@ -375,7 +374,7 @@ func (g *Graph) encodeType(T types.Type) {
 
 		v := encodeBytes(
 			[]byte{kindChan},
-			g.typToID.At(T.Elem()).([]byte),
+			g.typToID[T.Elem()],
 			[]byte{byte(T.Dir())},
 		)
 		g.set = badger.EntriesSet(g.set, key, v)
