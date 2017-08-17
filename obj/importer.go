@@ -3,7 +3,6 @@ package obj
 import (
 	"crypto/sha1"
 	"encoding/hex"
-	"errors"
 	"go/ast"
 	"go/build"
 	"go/parser"
@@ -16,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"honnef.co/go/tools/obj/cgo"
 
 	"golang.org/x/tools/go/buildutil"
 )
@@ -92,10 +93,7 @@ func (imp *Importer) ImportFrom(path, srcDir string, mode types.ImportMode) (*ty
 		return imp.g.Package(bpkg.ImportPath), nil
 	}
 	log.Println("found no archive for", bpkg.ImportPath)
-	// no (up to date) export data
-	if len(bpkg.CgoFiles) != 0 {
-		return nil, errors.New("cgo is not currently supported")
-	}
+
 	var files []*ast.File
 	for _, f := range bpkg.GoFiles {
 		af, err := buildutil.ParseFile(imp.Fset, &imp.build, nil, bpkg.Dir, f, parser.ParseComments)
@@ -104,6 +102,16 @@ func (imp *Importer) ImportFrom(path, srcDir string, mode types.ImportMode) (*ty
 		}
 		files = append(files, af)
 	}
+
+	if len(bpkg.CgoFiles) > 0 {
+		log.Println("processing cgo files")
+		cgoFiles, err := cgo.ProcessCgoFiles(bpkg, imp.Fset, nil, parser.ParseComments)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, cgoFiles...)
+	}
+
 	info := &types.Info{}
 	pkg, err := imp.checker.Check(path, imp.Fset, files, info)
 	if err != nil {
