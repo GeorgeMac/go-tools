@@ -65,10 +65,6 @@ func (g *Graph) Package(path string) *types.Package {
 	return pkg
 }
 
-func (g *Graph) getPackage(id []byte) *types.Package {
-	return g.idToPkg[string(id)]
-}
-
 func (g *Graph) decodeScope(scopes map[string][]byte, scope *types.Scope, id []byte) {
 	vals := decodeBytes(scopes[string(id)])
 	n, _ := binary.Uvarint(vals[0])
