@@ -9,12 +9,12 @@ import (
 	"go/token"
 	"go/types"
 	"log"
-	"reflect"
 
 	"golang.org/x/tools/go/buildutil"
 	"honnef.co/go/tools/obj/cgo"
 
 	"github.com/dgraph-io/badger"
+	"github.com/golang/snappy"
 	uuid "github.com/satori/go.uuid"
 )
 
@@ -35,6 +35,15 @@ import (
 // TODO(dh): add index mapping package names to import pathscd
 // TODO(dh): store AST, types.Info and checksums
 
+type Package struct {
+	*types.Package
+	*types.Info
+	Build *build.Package
+	Files []*ast.File
+}
+
+var Unsafe = &Package{Package: types.Unsafe}
+
 type Graph struct {
 	curpkg string
 
@@ -47,12 +56,13 @@ type Graph struct {
 
 	idToObj map[string]types.Object
 	idToTyp map[string]types.Type
-	idToPkg map[string]*types.Package
+	idToPkg map[string]*Package
 
 	// OPT(dh): merge idToPkg and pkgs
-	pkgs map[string]*types.Package
+	pkgs      map[string]*Package
+	augmented map[*types.Package]*Package
 
-	scopes map[*types.Package]map[string][]byte
+	scopes map[*Package]map[string][]byte
 	set    []*badger.Entry
 
 	build build.Context
@@ -70,21 +80,26 @@ func OpenGraph(dir string) (*Graph, error) {
 	}
 
 	g := &Graph{
-		Fset:    token.NewFileSet(),
-		kv:      kv,
-		objToID: map[types.Object][]byte{},
-		typToID: map[types.Type][]byte{},
-		idToObj: map[string]types.Object{},
-		idToTyp: map[string]types.Type{},
-		idToPkg: map[string]*types.Package{},
-		pkgs:    map[string]*types.Package{},
-		scopes:  map[*types.Package]map[string][]byte{},
-		build:   build.Default,
-		checker: &types.Config{},
+		Fset:      token.NewFileSet(),
+		kv:        kv,
+		objToID:   map[types.Object][]byte{},
+		typToID:   map[types.Type][]byte{},
+		idToObj:   map[string]types.Object{},
+		idToTyp:   map[string]types.Type{},
+		idToPkg:   map[string]*Package{},
+		pkgs:      map[string]*Package{},
+		scopes:    map[*Package]map[string][]byte{},
+		build:     build.Default,
+		checker:   &types.Config{},
+		augmented: map[*types.Package]*Package{},
 	}
 	g.checker.Importer = g
 
 	return g, nil
+}
+
+func (g *Graph) Augment(pkg *types.Package) *Package {
+	return g.augmented[pkg]
 }
 
 func (g *Graph) Import(path string) (*types.Package, error) {
@@ -103,12 +118,12 @@ func (g *Graph) ImportFrom(path, srcDir string, mode types.ImportMode) (*types.P
 
 	// TODO(dh): use checksum to verify that package is up to date
 	if pkg, ok := g.pkgs[bpkg.ImportPath]; ok {
-		return pkg, nil
+		return pkg.Package, nil
 	}
 	if g.HasPackage(bpkg.ImportPath) {
 		log.Println("importing from graph:", bpkg.ImportPath)
 		pkg := g.Package(bpkg.ImportPath)
-		return pkg, nil
+		return pkg.Package, nil
 	}
 
 	log.Println("compiling:", bpkg.ImportPath)
@@ -141,7 +156,13 @@ func (g *Graph) ImportFrom(path, srcDir string, mode types.ImportMode) (*types.P
 
 	// TODO(dh): build SSA
 
-	g.InsertPackage(bpkg, pkg)
+	apkg := &Package{
+		Package: pkg,
+		Info:    info,
+		Files:   files,
+		Build:   bpkg,
+	}
+	g.InsertPackage(apkg)
 	return pkg, nil
 }
 
@@ -156,15 +177,16 @@ func (g *Graph) HasPackage(path string) bool {
 	return ok
 }
 
-func (g *Graph) InsertPackage(bpkg *build.Package, pkg *types.Package) {
-	if pkg == types.Unsafe {
+func (g *Graph) InsertPackage(pkg *Package) {
+	if pkg.Package == types.Unsafe {
 		return
 	}
-	if _, ok := g.pkgs[bpkg.ImportPath]; ok {
+	if _, ok := g.pkgs[pkg.Build.ImportPath]; ok {
 		return
 	}
 	log.Println("inserting", pkg)
-	g.pkgs[bpkg.ImportPath] = pkg
+	g.pkgs[pkg.Build.ImportPath] = pkg
+	g.augmented[pkg.Package] = pkg
 
 	g.set = []*badger.Entry{}
 	for _, imp := range pkg.Imports() {
@@ -179,11 +201,16 @@ func (g *Graph) InsertPackage(bpkg *build.Package, pkg *types.Package) {
 	key = []byte(fmt.Sprintf("pkgs/%s\x00scope", pkg.Path()))
 	g.set = badger.EntriesSet(g.set, key, id)
 
+	ast := NewFileEncoder().Encode(pkg.Files)
+	cast := snappy.Encode(nil, ast)
+	key = []byte(fmt.Sprintf("pkgs/%s\x00ast", pkg.Path()))
+	g.set = badger.EntriesSet(g.set, key, cast)
+
 	g.kv.BatchSet(g.set)
 	g.set = nil
 }
 
-func (g *Graph) encodeScope(pkg *types.Package, scope *types.Scope) [16]byte {
+func (g *Graph) encodeScope(pkg *Package, scope *types.Scope) [16]byte {
 	id := [16]byte(uuid.NewV1())
 
 	var args [][]byte
@@ -235,235 +262,6 @@ const (
 	kindMap
 	kindChan
 )
-
-func (g *Graph) encodeObject(obj types.Object) {
-	if _, ok := g.objToID[obj]; ok {
-		return
-	}
-	if obj.Pkg() == nil {
-		g.objToID[obj] = []byte(fmt.Sprintf("builtin/%s", obj.Name()))
-		return
-	}
-	id := uuid.NewV1()
-	path := obj.Pkg().Path()
-	key := []byte(fmt.Sprintf("pkgs/%s\x00objects/%s", path, [16]byte(id)))
-	g.objToID[obj] = key
-
-	g.encodeType(obj.Type())
-	typID := g.typToID[obj.Type()]
-	var typ byte
-	switch obj.(type) {
-	case *types.Func:
-		typ = kindFunc
-	case *types.Var:
-		typ = kindVar
-	case *types.TypeName:
-		typ = kindTypename
-	case *types.Const:
-		typ = kindConst
-	case *types.PkgName:
-		typ = kindPkgname
-	default:
-		panic(fmt.Sprintf("%T", obj))
-	}
-
-	var v []byte
-	switch obj := obj.(type) {
-	case *types.PkgName:
-		v = encodeBytes(
-			[]byte(obj.Name()),
-			[]byte{typ},
-			typID,
-			[]byte(obj.Imported().Path()),
-		)
-	case *types.Const:
-		kind, data := encodeConstant(reflect.ValueOf(obj.Val()))
-		v = encodeBytes(
-			[]byte(obj.Name()),
-			[]byte{typ},
-			typID,
-			[]byte{kind},
-			data,
-		)
-	default:
-		v = encodeBytes(
-			[]byte(obj.Name()),
-			[]byte{typ},
-			typID,
-		)
-	}
-
-	g.set = badger.EntriesSet(g.set, key, v)
-}
-
-func encodeBytes(vs ...[]byte) []byte {
-	var out []byte
-	num := make([]byte, binary.MaxVarintLen64)
-	for _, v := range vs {
-		n := binary.PutUvarint(num, uint64(len(v)))
-		out = append(out, num[:n]...)
-		out = append(out, v...)
-	}
-	return out
-}
-
-func (g *Graph) encodeType(T types.Type) {
-	if id := g.typToID[T]; id != nil {
-		return
-	}
-	if T, ok := T.(*types.Basic); ok {
-		// OPT(dh): use an enum instead of strings for the built in
-		// types
-		g.typToID[T] = []byte(fmt.Sprintf("builtin/%s", T.Name()))
-		return
-	}
-	id := uuid.NewV1()
-	key := []byte(fmt.Sprintf("types/%s", [16]byte(id)))
-	g.typToID[T] = key
-
-	switch T := T.(type) {
-	case *types.Signature:
-		g.encodeType(T.Params())
-		g.encodeType(T.Results())
-		if T.Recv() != nil {
-			g.encodeObject(T.Recv())
-		}
-
-		variadic := byte(0)
-		if T.Variadic() {
-			variadic = 1
-		}
-		params := g.typToID[T.Params()]
-		results := g.typToID[T.Results()]
-		recv := g.objToID[T.Recv()]
-
-		v := encodeBytes(
-			[]byte{kindSignature},
-			params,
-			results,
-			recv,
-			[]byte{variadic},
-		)
-
-		g.set = badger.EntriesSet(g.set, key, v)
-	case *types.Named:
-		var args [][]byte
-		args = append(args, []byte{kindNamed})
-
-		underlying := T.Underlying()
-		g.encodeType(underlying)
-		args = append(args, g.typToID[underlying])
-
-		typename := T.Obj()
-		g.encodeObject(typename)
-		args = append(args, g.objToID[typename])
-
-		for i := 0; i < T.NumMethods(); i++ {
-			fn := T.Method(i)
-			g.encodeObject(fn)
-			args = append(args, g.objToID[fn])
-		}
-		v := encodeBytes(args...)
-		g.set = badger.EntriesSet(g.set, key, v)
-	case *types.Slice:
-		elem := T.Elem()
-		g.encodeType(elem)
-		v := encodeBytes(
-			[]byte{kindSlice},
-			g.typToID[elem],
-		)
-		g.set = badger.EntriesSet(g.set, key, v)
-	case *types.Pointer:
-		elem := T.Elem()
-		g.encodeType(elem)
-		v := encodeBytes(
-			[]byte{kindPointer},
-			g.typToID[elem],
-		)
-		g.set = badger.EntriesSet(g.set, key, v)
-	case *types.Interface:
-		var args [][]byte
-		args = append(args, []byte{kindInterface})
-
-		n := make([]byte, binary.MaxVarintLen64)
-		l := binary.PutUvarint(n, uint64(T.NumExplicitMethods()))
-		args = append(args, n[:l])
-
-		for i := 0; i < T.NumExplicitMethods(); i++ {
-			fn := T.ExplicitMethod(i)
-			g.encodeObject(fn)
-			args = append(args, g.objToID[fn])
-		}
-
-		n = make([]byte, binary.MaxVarintLen64)
-		l = binary.PutUvarint(n, uint64(T.NumEmbeddeds()))
-		args = append(args, n[:l])
-
-		for i := 0; i < T.NumEmbeddeds(); i++ {
-			embedded := T.Embedded(i)
-			g.encodeType(embedded)
-			args = append(args, g.typToID[embedded])
-		}
-		v := encodeBytes(args...)
-		g.set = badger.EntriesSet(g.set, key, v)
-	case *types.Array:
-		elem := T.Elem()
-		g.encodeType(elem)
-
-		n := make([]byte, binary.MaxVarintLen64)
-		l := binary.PutUvarint(n, uint64(T.Len()))
-		n = n[:l]
-		v := encodeBytes(
-			[]byte{kindArray},
-			g.typToID[elem],
-			n,
-		)
-		g.set = badger.EntriesSet(g.set, key, v)
-	case *types.Struct:
-		var args [][]byte
-		args = append(args, []byte{kindStruct})
-		for i := 0; i < T.NumFields(); i++ {
-			field := T.Field(i)
-			tag := T.Tag(i)
-			g.encodeObject(field)
-
-			args = append(args, g.objToID[field])
-			args = append(args, []byte(tag))
-		}
-		v := encodeBytes(args...)
-		g.set = badger.EntriesSet(g.set, key, v)
-	case *types.Tuple:
-		var args [][]byte
-		args = append(args, []byte{kindTuple})
-		for i := 0; i < T.Len(); i++ {
-			v := T.At(i)
-			g.encodeObject(v)
-			args = append(args, g.objToID[v])
-		}
-		v := encodeBytes(args...)
-		g.set = badger.EntriesSet(g.set, key, v)
-	case *types.Map:
-		g.encodeType(T.Key())
-		g.encodeType(T.Elem())
-		v := encodeBytes(
-			[]byte{kindMap},
-			g.typToID[T.Key()],
-			g.typToID[T.Elem()],
-		)
-		g.set = badger.EntriesSet(g.set, key, v)
-	case *types.Chan:
-		g.encodeType(T.Elem())
-
-		v := encodeBytes(
-			[]byte{kindChan},
-			g.typToID[T.Elem()],
-			[]byte{byte(T.Dir())},
-		)
-		g.set = badger.EntriesSet(g.set, key, v)
-	default:
-		panic(fmt.Sprintf("%T", T))
-	}
-}
 
 func (g *Graph) Close() error {
 	return g.kv.Close()

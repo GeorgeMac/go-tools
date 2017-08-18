@@ -8,6 +8,8 @@ import (
 	"unsafe"
 )
 
+// OPT(dh): optimize for size. for example, use varints.
+
 var (
 	tASTFile   = reflect.TypeOf(&ast.File{})
 	tASTObject = reflect.TypeOf(&ast.Object{})
@@ -185,7 +187,6 @@ func (dec *FileDecoder) Decode(b []byte) []*ast.File {
 type FileEncoder struct {
 	ptrs      map[interface{}]uint64
 	allocated map[uint64]interface{}
-	used      map[uint64]struct{}
 	maxPtr    uint64
 }
 
@@ -193,7 +194,6 @@ func NewFileEncoder() *FileEncoder {
 	return &FileEncoder{
 		ptrs:      map[interface{}]uint64{},
 		allocated: map[uint64]interface{}{},
-		used:      map[uint64]struct{}{},
 	}
 }
 
@@ -227,7 +227,6 @@ func (enc *FileEncoder) Encode(fs []*ast.File) []byte {
 		}
 
 		ptr := enc.ptr(node)
-		enc.used[ptr] = struct{}{}
 		tag := Types[reflect.TypeOf(node)]
 		b = appendInt(b, ptr)
 		b = append(b, tag)
@@ -309,12 +308,6 @@ func (enc *FileEncoder) Encode(fs []*ast.File) []byte {
 			for _, c := range cg.List {
 				marshalStruct(c)
 			}
-		}
-	}
-
-	for ptr, v := range enc.allocated {
-		if _, ok := enc.used[ptr]; !ok {
-			panic(fmt.Sprintf("dangling pointer %d to %T", ptr, v))
 		}
 	}
 

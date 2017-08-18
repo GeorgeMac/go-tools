@@ -8,11 +8,14 @@ import (
 	"log"
 
 	"github.com/dgraph-io/badger"
+	"github.com/golang/snappy"
 )
 
-func (g *Graph) Package(path string) *types.Package {
+// TODO(dh): unexport this function. public users have to go through
+// ImportFrom.
+func (g *Graph) Package(path string) *Package {
 	if path == "unsafe" {
-		return types.Unsafe
+		return Unsafe
 	}
 	if pkg, ok := g.pkgs[path]; ok {
 		return pkg
@@ -27,7 +30,9 @@ func (g *Graph) Package(path string) *types.Package {
 	it.Seek(key)
 	name := string(it.Item().Value())
 
-	pkg := types.NewPackage(path, name)
+	pkg := &Package{
+		Package: types.NewPackage(path, name),
+	}
 	g.pkgs[path] = pkg
 	g.idToPkg[fmt.Sprintf("pkgs/%s", path)] = pkg
 
@@ -35,7 +40,7 @@ func (g *Graph) Package(path string) *types.Package {
 	key = []byte(fmt.Sprintf("pkgs/%s\x00imports/", path))
 	for it.Seek(key); it.ValidForPrefix(key); it.Next() {
 		imp := string(it.Item().Key()[len(key):])
-		imps = append(imps, g.Package(imp))
+		imps = append(imps, g.Package(imp).Package)
 	}
 
 	key = []byte(fmt.Sprintf("pkgs/%s\x00objects/", path))
@@ -62,8 +67,18 @@ func (g *Graph) Package(path string) *types.Package {
 
 	// TODO(dh): clear g.scopes[pkg]
 
+	key = []byte(fmt.Sprintf("pkgs/%s\x00ast", path))
+	g.kv.Get(key, &item)
+	ast, err := snappy.Decode(nil, item.Value())
+	if err != nil {
+		panic(err)
+	}
+	pkg.Files = NewFileDecoder().Decode(ast)
+
 	pkg.SetImports(imps)
 	pkg.MarkComplete()
+
+	g.augmented[pkg.Package] = pkg
 
 	return pkg
 }
@@ -108,7 +123,7 @@ func (g *Graph) decodeObject(id []byte) types.Object {
 	return obj
 }
 
-func (g *Graph) decodeObjectItem(item *badger.KVItem, pkg *types.Package) (ret types.Object) {
+func (g *Graph) decodeObjectItem(item *badger.KVItem, pkg *Package) (ret types.Object) {
 	key := item.Key()
 	if obj, ok := g.idToObj[string(key)]; ok {
 		return obj
@@ -124,19 +139,19 @@ func (g *Graph) decodeObjectItem(item *badger.KVItem, pkg *types.Package) (ret t
 	switch typ[0] {
 	case kindFunc:
 		// XXX do scope
-		return types.NewFunc(0, pkg, name, T.(*types.Signature))
+		return types.NewFunc(0, pkg.Package, name, T.(*types.Signature))
 	case kindVar:
-		return types.NewVar(0, pkg, name, T)
+		return types.NewVar(0, pkg.Package, name, T)
 	case kindTypename:
-		return types.NewTypeName(0, pkg, name, T)
+		return types.NewTypeName(0, pkg.Package, name, T)
 	case kindConst:
 		kind := vals[3][0]
 		data := vals[4]
 		val := decodeConstant2(kind, data)
-		return types.NewConst(0, pkg, name, T, val)
+		return types.NewConst(0, pkg.Package, name, T, val)
 	case kindPkgname:
 		path := vals[3]
-		return types.NewPkgName(0, pkg, name, g.Package(string(path)))
+		return types.NewPkgName(0, pkg.Package, name, g.Package(string(path)).Package)
 	default:
 		panic(typ)
 	}
