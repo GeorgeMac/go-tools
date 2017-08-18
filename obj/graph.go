@@ -5,13 +5,17 @@ import (
 	"fmt"
 	"go/ast"
 	"go/build"
+	"go/constant"
 	"go/parser"
 	"go/token"
 	"go/types"
 	"log"
+	"reflect"
+	"unsafe"
 
 	"golang.org/x/tools/go/buildutil"
 	"honnef.co/go/tools/obj/cgo"
+	"honnef.co/go/tools/ssa"
 
 	"github.com/dgraph-io/badger"
 	"github.com/golang/snappy"
@@ -35,9 +39,24 @@ import (
 // TODO(dh): add index mapping package names to import pathscd
 // TODO(dh): store AST, types.Info and checksums
 
+type unsafeTypeAndValue struct {
+	mode  byte
+	Type  types.Type
+	Value constant.Value
+}
+
+type unsafeSelection struct {
+	kind     types.SelectionKind
+	recv     types.Type   // type of x
+	obj      types.Object // object denoted by x.f
+	index    []int        // path from x to x.f
+	indirect bool         // set if there was any pointer indirection on the path
+}
+
 type Package struct {
 	*types.Package
 	*types.Info
+	SSA   *ssa.Package
 	Build *build.Package
 	Files []*ast.File
 }
@@ -45,7 +64,7 @@ type Package struct {
 var Unsafe = &Package{Package: types.Unsafe}
 
 type Graph struct {
-	curpkg string
+	SSA *ssa.Program
 
 	Fset *token.FileSet
 
@@ -79,8 +98,10 @@ func OpenGraph(dir string) (*Graph, error) {
 		return nil, err
 	}
 
+	fset := token.NewFileSet()
 	g := &Graph{
-		Fset:      token.NewFileSet(),
+		SSA:       ssa.NewProgram(fset, 0),
+		Fset:      fset,
 		kv:        kv,
 		objToID:   map[types.Object][]byte{},
 		typToID:   map[types.Type][]byte{},
@@ -148,7 +169,15 @@ func (g *Graph) ImportFrom(path, srcDir string, mode types.ImportMode) (*types.P
 	}
 
 	// TODO(dh): collect info
-	info := &types.Info{}
+	info := &types.Info{
+		Types:      map[ast.Expr]types.TypeAndValue{},
+		Defs:       map[*ast.Ident]types.Object{},
+		Uses:       map[*ast.Ident]types.Object{},
+		Implicits:  map[ast.Node]types.Object{},
+		Selections: map[*ast.SelectorExpr]*types.Selection{},
+		Scopes:     map[ast.Node]*types.Scope{},
+		InitOrder:  []*types.Initializer{},
+	}
 	pkg, err := g.checker.Check(path, g.Fset, files, info)
 	if err != nil {
 		return nil, err
@@ -177,6 +206,44 @@ func (g *Graph) HasPackage(path string) bool {
 	return ok
 }
 
+type mapping struct {
+	astID   uint64
+	indexID []byte
+}
+
+type mappings []mapping
+
+func (m *mappings) add(astID uint64, indexID []byte) {
+	*m = append(*m, mapping{astID, indexID})
+}
+
+func (m *mappings) encode(b []byte) []byte {
+	// OPT(dh): come up with a more compact encoding.
+	b = appendInt(b, uint64(len(*m)))
+	for _, mapping := range *m {
+		b = appendInt(b, mapping.astID)
+		b = appendInt(b, uint64(len(mapping.indexID)))
+		b = append(b, mapping.indexID...)
+	}
+	return b
+}
+
+func (m *mappings) decode(b []byte) []byte {
+	n := binary.LittleEndian.Uint64(b)
+	b = b[8:]
+	for i := uint64(0); i < n; i++ {
+		astID := binary.LittleEndian.Uint64(b)
+		l := binary.LittleEndian.Uint64(b[8:])
+		// copy the bytes because the argument to decode likely comes
+		// from a KV store, and we don't own the slice.
+		indexID := make([]byte, l)
+		copy(indexID, b[16:16+l])
+		b = b[16+l:]
+		*m = append(*m, mapping{astID, indexID})
+	}
+	return b
+}
+
 func (g *Graph) InsertPackage(pkg *Package) {
 	if pkg.Package == types.Unsafe {
 		return
@@ -201,10 +268,114 @@ func (g *Graph) InsertPackage(pkg *Package) {
 	key = []byte(fmt.Sprintf("pkgs/%s\x00scope", pkg.Path()))
 	g.set = badger.EntriesSet(g.set, key, id)
 
-	ast := NewFileEncoder().Encode(pkg.Files)
+	fenc := NewFileEncoder()
+	ast := fenc.Encode(pkg.Files)
 	cast := snappy.Encode(nil, ast)
 	key = []byte(fmt.Sprintf("pkgs/%s\x00ast", pkg.Path()))
 	g.set = badger.EntriesSet(g.set, key, cast)
+
+	defs := new(mappings)
+	uses := new(mappings)
+	implicits := new(mappings)
+	for ident, obj := range pkg.Info.Defs {
+		if obj == nil {
+			continue
+		}
+		if _, ok := obj.(*types.Label); ok {
+			// XXX implement
+			continue
+		}
+		g.encodeObject(obj)
+		defs.add(fenc.ID(ident), g.objToID[obj])
+	}
+	for ident, obj := range pkg.Info.Uses {
+		if _, ok := obj.(*types.Label); ok {
+			// XXX implement
+			continue
+		}
+		if _, ok := obj.(*types.Builtin); ok {
+			continue
+		}
+		g.encodeObject(obj)
+		uses.add(fenc.ID(ident), g.objToID[obj])
+	}
+	for node, obj := range pkg.Info.Implicits {
+		g.encodeObject(obj)
+		implicits.add(fenc.ID(node), g.objToID[obj])
+	}
+	// TODO InitOrder
+	// TODO Scopes
+	var b []byte
+	b = defs.encode(b)
+	b = uses.encode(b)
+	b = implicits.encode(b)
+	n := len(pkg.Info.Types)
+	for expr := range pkg.Info.Types {
+		// when go/types encounters an IncDecStmt, it creates a new
+		// BasicLit with value 1. This node isn't part of the actual
+		// AST, yet it ends up in Info.Types. As far as we can tell,
+		// there is no way, other than iterating directly over
+		// Info.Types, to encounter this node. It shouldn't be
+		// necessary to serialize it.
+		astID := fenc.ID(expr)
+		if astID == 0 {
+			n--
+		}
+	}
+	b = appendInt(b, uint64(n))
+	for expr, tv := range pkg.Info.Types {
+		tv := *(*unsafeTypeAndValue)(unsafe.Pointer(&tv))
+		astID := fenc.ID(expr)
+		if astID == 0 {
+			continue
+		}
+		g.encodeType(tv.Type)
+		typID := g.typToID[tv.Type]
+		b = appendInt(b, astID)
+		b = appendInt(b, uint64(len(typID)))
+		b = append(b, typID...)
+		b = append(b, tv.mode)
+		if tv.Value == nil {
+			b = append(b, 0)
+		} else {
+			kind, data := encodeConstant(reflect.ValueOf(tv.Value))
+			b = append(b, kind)
+			b = appendInt(b, uint64(len(data)))
+			b = append(b, data...)
+		}
+	}
+
+	b = appendInt(b, uint64(len(pkg.Info.Selections)))
+	for expr, sel := range pkg.Info.Selections {
+		sel := (*unsafeSelection)(unsafe.Pointer(sel))
+
+		astID := fenc.ID(expr)
+		g.encodeType(sel.recv)
+		recvID := g.typToID[sel.recv]
+		g.encodeObject(sel.obj)
+		objID := g.objToID[sel.obj]
+		var t byte
+		if sel.indirect {
+			t = 1
+		}
+		kind := byte(sel.kind)
+
+		b = appendInt(b, astID)
+		b = appendInt(b, uint64(len(recvID)))
+		b = append(b, recvID...)
+		b = appendInt(b, uint64(len(objID)))
+		b = append(b, objID...)
+		b = appendInt(b, uint64(len(sel.index)))
+		for _, idx := range sel.index {
+			b = appendInt(b, uint64(idx))
+		}
+		b = append(b, t)
+		b = append(b, kind)
+	}
+
+	// OPT(dh): consider compressing the mapping
+	key = []byte(fmt.Sprintf("pkgs/%s\x00mapping", pkg.Path()))
+	g.set = badger.EntriesSet(g.set, key, b)
 
 	g.kv.BatchSet(g.set)
 	g.set = nil

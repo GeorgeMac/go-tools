@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"go/ast"
+	"go/constant"
 	"go/types"
-	"log"
+	"strings"
+	"unsafe"
 
 	"github.com/dgraph-io/badger"
 	"github.com/golang/snappy"
@@ -20,8 +23,6 @@ func (g *Graph) Package(path string) *Package {
 	if pkg, ok := g.pkgs[path]; ok {
 		return pkg
 	}
-
-	g.curpkg = path
 
 	opt := badger.DefaultIteratorOptions
 	it := g.kv.NewIterator(opt)
@@ -69,17 +70,118 @@ func (g *Graph) Package(path string) *Package {
 
 	key = []byte(fmt.Sprintf("pkgs/%s\x00ast", path))
 	g.kv.Get(key, &item)
-	ast, err := snappy.Decode(nil, item.Value())
+	astData, err := snappy.Decode(nil, item.Value())
 	if err != nil {
 		panic(err)
 	}
-	pkg.Files = NewFileDecoder().Decode(ast)
+	fdec := NewFileDecoder()
+	pkg.Files = fdec.Decode(astData)
+
+	pkg.Info = &types.Info{
+		Types:      map[ast.Expr]types.TypeAndValue{},
+		Defs:       map[*ast.Ident]types.Object{},
+		Uses:       map[*ast.Ident]types.Object{},
+		Implicits:  map[ast.Node]types.Object{},
+		Selections: map[*ast.SelectorExpr]*types.Selection{},
+		Scopes:     map[ast.Node]*types.Scope{},
+		InitOrder:  []*types.Initializer{},
+	}
+	key = []byte(fmt.Sprintf("pkgs/%s\x00mapping", path))
+	g.kv.Get(key, &item)
+
+	data := item.Value()
+	defs := new(mappings)
+	uses := new(mappings)
+	implicits := new(mappings)
+	data = defs.decode(data)
+	data = uses.decode(data)
+	data = implicits.decode(data)
+
+	n := binary.LittleEndian.Uint64(data)
+	data = data[8:]
+	for i := uint64(0); i < n; i++ {
+		astID := binary.LittleEndian.Uint64(data)
+		l := binary.LittleEndian.Uint64(data[8:])
+		data = data[16:]
+		typID := data[:l]
+		mode := data[l]
+		data = data[l+1:]
+		kind := data[0]
+		var c constant.Value
+		data = data[1:]
+		if kind != 0 {
+			l := binary.LittleEndian.Uint64(data)
+			c = decodeConstant2(kind, data[8:8+l])
+			data = data[8+l:]
+		}
+
+		expr := fdec.Object(astID).(ast.Expr)
+		T := g.decodeType(typID)
+
+		tv := unsafeTypeAndValue{
+			mode:  mode,
+			Type:  T,
+			Value: c,
+		}
+		pkg.Info.Types[expr] = *(*types.TypeAndValue)(unsafe.Pointer(&tv))
+	}
+
+	n = binary.LittleEndian.Uint64(data)
+	data = data[8:]
+	for i := uint64(0); i < n; i++ {
+		astID := binary.LittleEndian.Uint64(data)
+		l := binary.LittleEndian.Uint64(data[8:])
+		data = data[16:]
+		recvID := data[:l]
+		data = data[l:]
+		l = binary.LittleEndian.Uint64(data)
+		data = data[8:]
+		objID := data[:l]
+		data = data[l:]
+		n := binary.LittleEndian.Uint64(data)
+		data = data[8:]
+		var idx []int
+		for j := uint64(0); j < n; j++ {
+			idx = append(idx, int(binary.LittleEndian.Uint64(data[j*8:])))
+		}
+		data = data[n*8:]
+		indirect := data[0] != 0
+		kind := data[1]
+		data = data[2:]
+
+		sel := unsafeSelection{
+			kind:     types.SelectionKind(kind),
+			recv:     g.decodeType(recvID),
+			obj:      g.decodeObject(objID),
+			index:    idx,
+			indirect: indirect,
+		}
+
+		expr := fdec.Object(astID).(*ast.SelectorExpr)
+		pkg.Info.Selections[expr] = (*types.Selection)(unsafe.Pointer(&sel))
+	}
+
+	if len(data) != 0 {
+		panic("internal inconsistency")
+	}
+
+	for _, m := range *defs {
+		pkg.Info.Defs[fdec.Object(m.astID).(*ast.Ident)] = g.decodeObject(m.indexID)
+	}
+	for _, m := range *uses {
+		pkg.Info.Uses[fdec.Object(m.astID).(*ast.Ident)] = g.decodeObject(m.indexID)
+	}
+	for _, m := range *implicits {
+		pkg.Info.Implicits[fdec.Object(m.astID).(ast.Node)] = g.decodeObject(m.indexID)
+	}
 
 	pkg.SetImports(imps)
 	pkg.MarkComplete()
 
 	g.augmented[pkg.Package] = pkg
 
+	pkg.SSA = g.SSA.CreatePackage(pkg.Package, pkg.Files, pkg.Info, true)
+	pkg.SSA.Build()
 	return pkg
 }
 
@@ -104,20 +206,24 @@ func (g *Graph) decodeObject(id []byte) types.Object {
 		return obj
 	}
 	// OPT(dh): cache these builtin objects
-	switch string(id) {
-	case "builtin/error":
-		return types.Universe.Lookup("error")
-	case "builtin/Error":
-		return types.Universe.Lookup("error").(*types.TypeName).Type().(*types.Named).Underlying().(*types.Interface).Method(0)
+	sid := string(id)
+	if strings.HasPrefix(sid, "builtin/") {
+		switch sid {
+		default:
+			name := strings.TrimPrefix(sid, "builtin/")
+			return types.Universe.Lookup(name)
+		case "builtin/Error":
+			return types.Universe.Lookup("error").(*types.TypeName).Type().(*types.Named).Underlying().(*types.Interface).Method(0)
+		}
+	}
+	if strings.HasPrefix(sid, "unsafe/") {
+		name := strings.TrimPrefix(sid, "unsafe/")
+		return types.Unsafe.Scope().Lookup(name)
 	}
 	var item badger.KVItem
 	g.kv.Get(id, &item)
 	parts := bytes.SplitN(id, []byte{0}, 2)
 	pkg := g.idToPkg[string(parts[0])]
-	if pkg == nil {
-		log.Printf("don't know package %s for object %q, used by package %s", parts[0], id, g.curpkg)
-		panic("")
-	}
 	obj := g.decodeObjectItem(&item, pkg)
 	g.idToObj[string(id)] = obj
 	return obj
@@ -134,24 +240,28 @@ func (g *Graph) decodeObjectItem(item *badger.KVItem, pkg *Package) (ret types.O
 
 	vals := decodeBytes(item.Value())
 	name, typ, typID := string(vals[0]), vals[1], vals[2]
+	var tpkg *types.Package
+	if pkg != nil {
+		tpkg = pkg.Package
+	}
 
 	T := g.decodeType(typID)
 	switch typ[0] {
 	case kindFunc:
 		// XXX do scope
-		return types.NewFunc(0, pkg.Package, name, T.(*types.Signature))
+		return types.NewFunc(0, tpkg, name, T.(*types.Signature))
 	case kindVar:
-		return types.NewVar(0, pkg.Package, name, T)
+		return types.NewVar(0, tpkg, name, T)
 	case kindTypename:
-		return types.NewTypeName(0, pkg.Package, name, T)
+		return types.NewTypeName(0, tpkg, name, T)
 	case kindConst:
 		kind := vals[3][0]
 		data := vals[4]
 		val := decodeConstant2(kind, data)
-		return types.NewConst(0, pkg.Package, name, T, val)
+		return types.NewConst(0, tpkg, name, T, val)
 	case kindPkgname:
 		path := vals[3]
-		return types.NewPkgName(0, pkg.Package, name, g.Package(string(path)).Package)
+		return types.NewPkgName(0, tpkg, name, g.Package(string(path)).Package)
 	default:
 		panic(typ)
 	}

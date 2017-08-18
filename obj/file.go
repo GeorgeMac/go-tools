@@ -197,9 +197,8 @@ func NewFileEncoder() *FileEncoder {
 	}
 }
 
-func (enc *FileEncoder) ID(v interface{}) (uint64, bool) {
-	id, ok := enc.ptrs[v]
-	return id, ok
+func (enc *FileEncoder) ID(v interface{}) uint64 {
+	return enc.ptrs[v]
 }
 
 func (enc *FileEncoder) ptr(v interface{}) uint64 {
